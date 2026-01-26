@@ -1,0 +1,38 @@
+{
+  "name": "mycroshop-ai-sales-agent",
+  "version": "1.0.0",
+  "description": "AI Sales Agent for MycroShop - WhatsApp Integration with Gemini",
+  "main": "index.js",
+  "scripts": {
+    "dev": "functions-framework --target=whatsappWebhook --port=8080",
+    "deploy": "gcloud functions deploy",
+    "test": "jest",
+    "test:webhook": "node test/webhook.test.js"
+  },
+  "dependencies": {
+    "@google-cloud/functions-framework": "^3.3.0",
+    "@google/generative-ai": "^0.21.0",
+    "firebase-admin": "^12.0.0",
+    "axios": "^1.7.7",
+    "crypto": "^1.0.1",
+    "mysql2": "^3.11.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "ai",
+    "whatsapp",
+    "sales",
+    "gemini",
+    "google-cloud"
+  ],
+  "author": "MycroShop",
+  "license": "PROPRIETARY"
+}
+
