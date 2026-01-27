@@ -9,9 +9,6 @@ const contactPricing = require('../../lib/contact-pricing');
 const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 const { initializeApp } = require('firebase-admin/app');
 const admin = require('firebase-admin');
-const { getFirestore, FieldValue } = require('firebase-admin/firestore');
-const { initializeApp } = require('firebase-admin/app');
-const admin = require('firebase-admin');
 
 // Initialize Gemini AI
 const ai = new gemini(process.env.GEMINI_API_KEY);

@@ -4,11 +4,11 @@
   "description": "AI Sales Agent for MycroShop - WhatsApp Integration with Gemini",
   "main": "index.js",
   "scripts": {
-    "dev": "functions-framework --target=whatsappWebhook --port=8080",
+    "dev": "functions-framework --target=whatsappWebhook --source=functions/whatsapp-webhook --port=8080",
+    "start": "functions-framework --target=whatsappWebhook --source=functions/whatsapp-webhook",
     "deploy": "gcloud functions deploy",
     "test": "jest",
-    "test:webhook": "node test/webhook.test.js",
-    "start": "functions-framework --target=whatsappWebhook --port=${PORT:-8080}"
+    "test:webhook": "node test/webhook.test.js"
   },
   "dependencies": {
     "@google-cloud/functions-framework": "^3.3.0",
