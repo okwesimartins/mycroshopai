@@ -7,7 +7,8 @@
     "dev": "functions-framework --target=whatsappWebhook --port=8080",
     "deploy": "gcloud functions deploy",
     "test": "jest",
-    "test:webhook": "node test/webhook.test.js"
+    "test:webhook": "node test/webhook.test.js",
+    "start": "functions-framework --target=whatsappWebhook --port=${PORT:-8080}"
   },
   "dependencies": {
     "@google-cloud/functions-framework": "^3.3.0",
