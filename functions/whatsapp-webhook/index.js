@@ -25,17 +25,37 @@ functions.http('whatsappWebhook', async (req, res) => {
 
     // Handle webhook events (POST request)
     if (req.method === 'POST') {
-      // Verify webhook signature
-      const signature = req.headers['x-hub-signature-256'];
-      const isValid = whatsapp.verifyWebhookSignature(
-        signature,
-        JSON.stringify(req.body),
-        process.env.META_APP_SECRET
-      );
+      // Basic logging to confirm that POST webhooks are reaching the service
+      console.log('Incoming WhatsApp webhook', {
+        method: req.method,
+        path: req.path,
+        headers: {
+          'x-hub-signature-256': req.headers['x-hub-signature-256'],
+          'user-agent': req.headers['user-agent']
+        }
+      });
 
-      if (!isValid) {
-        console.error('Invalid webhook signature');
-        return res.status(401).json({ error: 'Invalid signature' });
+      const skipSignatureCheck = process.env.META_SKIP_SIGNATURE_CHECK === 'true';
+
+      if (!skipSignatureCheck) {
+        // Verify webhook signature using the raw request body when available
+        const rawPayload = req.rawBody
+          ? req.rawBody.toString('utf8')
+          : JSON.stringify(req.body || {});
+
+        const signature = req.headers['x-hub-signature-256'];
+        const isValid = whatsapp.verifyWebhookSignature(
+          signature,
+          rawPayload,
+          process.env.META_APP_SECRET
+        );
+
+        if (!isValid) {
+          console.error('Invalid webhook signature');
+          return res.status(401).json({ error: 'Invalid signature' });
+        }
+      } else {
+        console.warn('Skipping WhatsApp webhook signature verification because META_SKIP_SIGNATURE_CHECK=true');
       }
 
       // Parse webhook payload
