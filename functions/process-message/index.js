@@ -26,6 +26,7 @@ async function processMessage(messageData) {
     // Get tenant information
     const tenantInfo = await database.getTenantInfo(tenantId);
     const subscriptionPlan = tenantInfo.subscription_plan || 'free';
+    const storeName = tenantInfo.name || 'our store';
 
     // Check contact limit before processing
     const contactLimit = await firestore.checkContactLimit(tenantId);
@@ -57,6 +58,7 @@ async function processMessage(messageData) {
       tenant_id: tenantId,
       subscription_plan: subscriptionPlan,
       customer_phone: customerPhone,
+      store_name: storeName,
       conversation_history: conversationHistory
     };
 
