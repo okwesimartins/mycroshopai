@@ -1,6 +1,6 @@
 const functions = require('@google-cloud/functions-framework');
 const whatsapp = require('../../lib/whatsapp');
-const database = require('../../lib/database');
+const backendApi = require('../../lib/backend-api');
 const { processMessage } = require('../process-message');
 
 /**
@@ -68,19 +68,29 @@ functions.http('whatsappWebhook', async (req, res) => {
 
       console.log('Received message:', messageData);
 
-      // Get tenant from phone number ID
-      // In production, you'd have a mapping table: phone_number_id -> tenant_id
-      // For now, we'll extract from WhatsApp connection or use a default
-      const tenantId = await getTenantFromPhoneNumber(messageData.phoneNumberId);
+      // Resolve tenant via backend API (no DB from Cloud)
+      const tenantContext = await backendApi.resolveTenant(messageData.phoneNumberId);
 
-      if (!tenantId) {
+      if (!tenantContext) {
         console.error('Tenant not found for phone number:', messageData.phoneNumberId);
         return res.status(200).json({ status: 'ok' }); // Return 200 to prevent retries
       }
 
-      // Process message asynchronously
+      const {
+        tenant_id,
+        access_token,
+        store_name,
+        subscription_plan,
+        default_online_store_id
+      } = tenantContext;
+
+      // Process message asynchronously (API + Firestore only; no DB)
       processMessage({
-        tenantId,
+        tenantId: tenant_id,
+        accessToken: access_token,
+        storeName: store_name,
+        subscriptionPlan: subscription_plan || 'enterprise',
+        defaultOnlineStoreId: default_online_store_id,
         customerPhone: messageData.from,
         message: messageData.text,
         messageId: messageData.messageId,
@@ -100,56 +110,4 @@ functions.http('whatsappWebhook', async (req, res) => {
   }
 });
 
-/**
- * Get tenant ID from WhatsApp phone number ID
- * In production, this would query a database table mapping phone_number_id to tenant_id
- */
-async function getTenantFromPhoneNumber(phoneNumberId) {
-  try {
-    const debugStart = Date.now();
-    console.log('[WhatsAppWebhook] Resolving tenant from phone number', {
-      phoneNumberId
-    });
-
-    // Option 1: Query database for WhatsApp connection (if DB is reachable)
-    // This assumes you have a whatsapp_connections table
-    const pool = await database.initializeMainDb();
-    console.log('[WhatsAppWebhook] Main DB pool acquired in', `${Date.now() - debugStart}ms`, {
-      mainDbHost: process.env.MAIN_DB_HOST,
-      mainDbName: process.env.MAIN_DB_NAME || 'mycroshop_main'
-    });
-
-    const queryStart = Date.now();
-    const [rows] = await pool.execute(
-      'SELECT tenant_id FROM whatsapp_connections WHERE phone_number_id = ? LIMIT 1',
-      [phoneNumberId]
-    );
-    console.log('[WhatsAppWebhook] Query completed in', `${Date.now() - queryStart}ms`, {
-      rowsFound: rows.length
-    });
-
-    if (rows.length > 0) {
-      return rows[0].tenant_id;
-    }
-
-    // Option 2: Use environment variable for single tenant (development)
-    if (process.env.DEFAULT_TENANT_ID) {
-      console.log('[WhatsAppWebhook] Falling back to DEFAULT_TENANT_ID from env');
-      return parseInt(process.env.DEFAULT_TENANT_ID, 10);
-    }
-
-    console.warn('[WhatsAppWebhook] No tenant mapping and no DEFAULT_TENANT_ID configured');
-    return null;
-  } catch (error) {
-    console.error('[WhatsAppWebhook] Error getting tenant from phone number:', {
-      phoneNumberId,
-      code: error.code,
-      errno: error.errno,
-      sqlState: error.sqlState,
-      sqlMessage: error.sqlMessage,
-      message: error.message
-    });
-    return null;
-  }
-}
 

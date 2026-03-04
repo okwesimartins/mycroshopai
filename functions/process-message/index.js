@@ -1,14 +1,9 @@
-const database = require('../../lib/database');
 const gemini = require('../../lib/gemini');
 const whatsapp = require('../../lib/whatsapp');
-const inventory = require('../../lib/inventory');
-const orders = require('../../lib/orders');
-const payments = require('../../lib/payments');
+const backendApi = require('../../lib/backend-api');
 const firestore = require('../../lib/firestore');
 const contactPricing = require('../../lib/contact-pricing');
-const { getFirestore, FieldValue } = require('firebase-admin/firestore');
-const { initializeApp } = require('firebase-admin/app');
-const admin = require('firebase-admin');
+const payments = require('../../lib/payments'); // for formatPaymentConfirmation only
 
 // Initialize Gemini AI
 const ai = new gemini(process.env.GEMINI_API_KEY);
@@ -18,17 +13,25 @@ const ai = new gemini(process.env.GEMINI_API_KEY);
  * @param {Object} messageData - Message data
  */
 async function processMessage(messageData) {
-  const { tenantId, customerPhone, message, messageId, phoneNumberId } = messageData;
+  const {
+    tenantId,
+    accessToken,
+    storeName,
+    subscriptionPlan: subscriptionPlanFromWebhook,
+    defaultOnlineStoreId,
+    customerPhone,
+    message,
+    messageId,
+    phoneNumberId
+  } = messageData;
+
+  const subscriptionPlan = subscriptionPlanFromWebhook || 'enterprise';
+  const storeNameResolved = storeName || 'our store';
 
   try {
     console.log(`Processing message for tenant ${tenantId}:`, message);
 
-    // Get tenant information
-    const tenantInfo = await database.getTenantInfo(tenantId);
-    const subscriptionPlan = tenantInfo.subscription_plan || 'free';
-    const storeName = tenantInfo.name || 'our store';
-
-    // Check contact limit before processing
+    // Check contact limit before processing (Firestore)
     const contactLimit = await firestore.checkContactLimit(tenantId);
     
     if (contactLimit.reached) {
@@ -43,7 +46,8 @@ async function processMessage(messageData) {
           customerPhone,
           `Sorry, you've reached your contact limit (${contactLimit.count}/${contactLimit.limit}). ` +
           `Please upgrade your plan to continue receiving messages from new customers. ` +
-          `Contact support for assistance.`
+          `Contact support for assistance.`,
+          accessToken
         );
         return;
       }
@@ -58,27 +62,36 @@ async function processMessage(messageData) {
       tenant_id: tenantId,
       subscription_plan: subscriptionPlan,
       customer_phone: customerPhone,
-      store_name: storeName,
+      store_name: storeNameResolved,
       conversation_history: conversationHistory
     };
 
     const aiResponse = await ai.processMessage(message, context);
 
-    // Handle AI actions
+    // Handle AI actions (via backend API)
     let finalResponse = aiResponse.text;
 
     if (aiResponse.actions && aiResponse.actions.length > 0) {
       for (const action of aiResponse.actions) {
-        const actionResult = await handleAction(action, tenantId, subscriptionPlan, message, conversationHistory);
-        
-        if (actionResult) {
-          finalResponse = actionResult;
+        const actionResult = await handleAction(action, {
+          tenantId,
+          subscriptionPlan,
+          defaultOnlineStoreId,
+          message,
+          conversationHistory,
+          accessToken,
+          phoneNumberId,
+          customerPhone
+        });
+
+        if (actionResult != null) {
+          finalResponse = typeof actionResult === 'string' ? actionResult : actionResult.response || finalResponse;
         }
       }
     }
 
-    // Send response via WhatsApp
-    await sendWhatsAppResponse(phoneNumberId, customerPhone, finalResponse);
+    // Send response via WhatsApp (using token from resolve-tenant)
+    await sendWhatsAppResponse(phoneNumberId, customerPhone, finalResponse, accessToken);
 
     // Save conversation history to Firestore
     await firestore.saveMessage(tenantId, customerPhone, 'user', message, messageId);
@@ -95,7 +108,8 @@ async function processMessage(messageData) {
       await sendWhatsAppResponse(
         phoneNumberId,
         customerPhone,
-        'Sorry, I encountered an error. Please try again or contact support.'
+        'Sorry, I encountered an error. Please try again or contact support.',
+        accessToken
       );
     } catch (sendError) {
       console.error('Error sending error message:', sendError);
@@ -104,16 +118,20 @@ async function processMessage(messageData) {
 }
 
 /**
- * Handle AI actions (query inventory, create order, etc.)
+ * Handle AI actions (via backend API: inventory, list catalog, order, payment)
  */
-async function handleAction(action, tenantId, subscriptionPlan, message, conversationHistory) {
+async function handleAction(action, ctx) {
+  const { tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory } = ctx;
   try {
     switch (action.type) {
       case 'query_inventory':
-        return await handleInventoryQuery(tenantId, subscriptionPlan, message);
+        return await handleInventoryQuery(tenantId, subscriptionPlan, message, action.intent);
+
+      case 'list_inventory':
+        return await handleListInventory(ctx, action.share_media === true);
 
       case 'create_order':
-        return await handleOrderCreation(tenantId, subscriptionPlan, message, conversationHistory);
+        return await handleOrderCreation(tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory);
 
       case 'check_payment':
         return await handlePaymentCheck(tenantId, message);
@@ -128,33 +146,31 @@ async function handleAction(action, tenantId, subscriptionPlan, message, convers
 }
 
 /**
- * Handle inventory query
+ * Handle inventory query (via backend API) – single product (price, availability, stock)
  */
-async function handleInventoryQuery(tenantId, subscriptionPlan, message) {
+async function handleInventoryQuery(tenantId, subscriptionPlan, message, intent) {
   try {
-    // Extract product name from message
     const productName = extractProductName(message);
-    
     if (!productName) {
+      if (intent === 'price') return null;
       return 'Could you please specify which product you\'re looking for?';
     }
 
-    // Check availability
-    const availability = await inventory.checkAvailability(
-      tenantId,
-      subscriptionPlan,
-      productName
-    );
-
-    if (availability.available) {
-      return `✅ ${availability.message}\n\n` +
-             `Product: ${availability.product.name}\n` +
-             `Price: ₦${parseFloat(availability.product.price || 0).toLocaleString()}\n` +
-             `Stock: ${availability.stock} available\n\n` +
-             `Would you like to place an order?`;
-    } else {
-      return `❌ ${availability.message}`;
+    const result = await backendApi.checkProduct(tenantId, productName, subscriptionPlan);
+    if (!result) {
+      return 'Sorry, I couldn\'t check availability. Please try again.';
     }
+
+    if (result.exists && result.product) {
+      const p = result.product;
+      const stock = p.stock != null ? p.stock : 0;
+      return `✅ ${result.message || 'Product found'}\n\n` +
+             `Product: ${p.name}\n` +
+             `Price: ₦${parseFloat(p.price || 0).toLocaleString()}\n` +
+             `Stock: ${stock} available\n\n` +
+             `Would you like to place an order?`;
+    }
+    return `❌ ${result.message || 'Product not found'}`;
   } catch (error) {
     console.error('Error handling inventory query:', error);
     return 'Sorry, I encountered an error checking availability. Please try again.';
@@ -162,11 +178,72 @@ async function handleInventoryQuery(tenantId, subscriptionPlan, message) {
 }
 
 /**
- * Handle order creation
+ * Handle list inventory / catalog (via backend API). Optionally send product images via WhatsApp.
  */
-async function handleOrderCreation(tenantId, subscriptionPlan, message, conversationHistory) {
+async function handleListInventory(ctx, shareMedia) {
+  const { tenantId, subscriptionPlan, message, accessToken, phoneNumberId, customerPhone } = ctx;
   try {
-    // Extract order details using AI
+    const search = extractProductName(message) || extractSearchTerm(message);
+    const listResult = await backendApi.listProducts(tenantId, subscriptionPlan, {
+      search: search || undefined,
+      limit: 15
+    });
+
+    if (!listResult || !listResult.products || listResult.products.length === 0) {
+      return search
+        ? `We don't have any products matching "${search}" right now. Try another search or ask for our full catalog.`
+        : 'We don\'t have any products in the catalog at the moment. Check back later!';
+    }
+
+    const products = listResult.products;
+    const withImages = products.filter(p => p.image_url && p.image_url.startsWith('http'));
+
+    if (shareMedia && withImages.length > 0 && accessToken && phoneNumberId && customerPhone) {
+      const maxImages = 5;
+      for (let i = 0; i < Math.min(withImages.length, maxImages); i++) {
+        const p = withImages[i];
+        const caption = `${p.name} – ₦${parseFloat(p.price || 0).toLocaleString()}${p.stock != null ? ` (${p.stock} in stock)` : ''}`;
+        try {
+          await whatsapp.sendImage(phoneNumberId, accessToken, customerPhone, p.image_url, caption);
+        } catch (err) {
+          console.error('Error sending product image:', err.message);
+        }
+      }
+    }
+
+    let text = `📦 Here are our products${search ? ` matching "${search}"` : ''}:\n\n`;
+    products.forEach((p, i) => {
+      text += `${i + 1}. ${p.name} – ₦${parseFloat(p.price || 0).toLocaleString()}`;
+      if (p.stock != null) text += ` (${p.stock} in stock)`;
+      text += '\n';
+    });
+    text += '\nWould you like details on any product or to place an order?';
+    return text;
+  } catch (error) {
+    console.error('Error handling list inventory:', error);
+    return 'Sorry, I couldn\'t load the catalog. Please try again.';
+  }
+}
+
+function extractSearchTerm(message) {
+  const m = (message || '').toLowerCase();
+  const patterns = [
+    /(?:show|list|get|send|see).*?(?:products?|items?|catalog|inventory)\s+(?:for|about|like)?\s*[:\-]?\s*(.+?)(?:\?|$|\.)/i,
+    /(?:what|which)\s+(?:products?|items?).*?(?:have|offer|sell)\s+(?:for|about)?\s*(.+?)(?:\?|$|\.)/i,
+    /(?:search|find)\s+(.+?)(?:\?|$|\.)/i
+  ];
+  for (const pattern of patterns) {
+    const match = (message || '').match(pattern);
+    if (match && match[1]) return match[1].trim();
+  }
+  return null;
+}
+
+/**
+ * Handle order creation (via backend API)
+ */
+async function handleOrderCreation(tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory) {
+  try {
     const orderDetails = await ai.extractOrderDetails(message, conversationHistory);
 
     if (!orderDetails || !orderDetails.items || orderDetails.items.length === 0) {
@@ -176,30 +253,32 @@ async function handleOrderCreation(tenantId, subscriptionPlan, message, conversa
              '3. Your name and contact details';
     }
 
-    // Validate and check availability for each item
+    if (!defaultOnlineStoreId) {
+      return 'Sorry, this store has no online store configured. Please contact the merchant.';
+    }
+
     const validatedItems = [];
     for (const item of orderDetails.items) {
-      const availability = await inventory.checkAvailability(
-        tenantId,
-        subscriptionPlan,
-        item.product_name,
-        item.quantity
-      );
-
-      if (!availability.available) {
-        return `Sorry, "${item.product_name}" is not available in the quantity you requested. ${availability.message}`;
+      const result = await backendApi.checkProduct(tenantId, item.product_name, subscriptionPlan);
+      if (!result || !result.exists || !result.product) {
+        return `Sorry, "${item.product_name}" is not available. ${(result && result.message) || ''}`;
       }
-
+      const p = result.product;
+      const qty = item.quantity || 1;
+      const stock = p.stock != null ? p.stock : 0;
+      if (stock < qty) {
+        return `Sorry, "${p.name}" has only ${stock} in stock. You requested ${qty}.`;
+      }
       validatedItems.push({
-        product_id: availability.product.id || availability.product.product_id,
-        product_name: availability.product.name,
-        quantity: item.quantity,
-        price: availability.product.price
+        product_id: p.id,
+        product_name: p.name,
+        quantity: qty,
+        price: p.price
       });
     }
 
-    // Create order
-    const orderResult = await orders.createOrder(tenantId, {
+    const orderResult = await backendApi.createOrder(tenantId, {
+      online_store_id: defaultOnlineStoreId,
       items: validatedItems,
       customer_info: {
         name: orderDetails.customer_name || 'WhatsApp Customer',
@@ -210,30 +289,37 @@ async function handleOrderCreation(tenantId, subscriptionPlan, message, conversa
     });
 
     if (orderResult.success) {
-      return orders.formatOrderConfirmation(orderResult.order, orderResult.paymentLink);
-    } else {
-      return 'Sorry, I encountered an error creating your order. Please try again.';
+      return formatOrderConfirmation(orderResult.order, orderResult.paymentLink);
     }
+    return 'Sorry, I encountered an error creating your order. Please try again.';
   } catch (error) {
     console.error('Error handling order creation:', error);
     return 'Sorry, I encountered an error creating your order. Please try again or contact support.';
   }
 }
 
+function formatOrderConfirmation(order, paymentLink) {
+  let msg = `✅ Order created!\n\nOrder #${order?.id || order?.order_number || 'N/A'}\n`;
+  if (order?.total != null) {
+    msg += `Total: ₦${parseFloat(order.total).toLocaleString()}\n`;
+  }
+  if (paymentLink) {
+    msg += `\nPay here: ${paymentLink}`;
+  }
+  return msg;
+}
+
 /**
- * Handle payment check
+ * Handle payment check (via backend API)
  */
 async function handlePaymentCheck(tenantId, message) {
   try {
-    // Extract payment reference from message
     const reference = extractPaymentReference(message);
-    
     if (!reference) {
       return 'Please provide your payment reference number to check payment status.';
     }
 
-    const paymentResult = await payments.verifyPayment(reference, tenantId);
-
+    const paymentResult = await backendApi.verifyPayment(tenantId, reference);
     return payments.formatPaymentConfirmation(paymentResult);
   } catch (error) {
     console.error('Error handling payment check:', error);
@@ -242,66 +328,46 @@ async function handlePaymentCheck(tenantId, message) {
 }
 
 /**
- * Send WhatsApp response
+ * Send WhatsApp response (access token from resolve-tenant, no DB)
  */
-async function sendWhatsAppResponse(phoneNumberId, to, message) {
-  try {
-    // Get access token for this phone number
-    // In production, you'd get this from database
-    const accessToken = await getAccessToken(phoneNumberId);
-
-    if (!accessToken) {
-      throw new Error('Access token not found for phone number');
-    }
-
-    await whatsapp.sendMessage(phoneNumberId, accessToken, to, message);
-  } catch (error) {
-    console.error('Error sending WhatsApp response:', error);
-    throw error;
+async function sendWhatsAppResponse(phoneNumberId, to, message, accessToken) {
+  if (!accessToken) {
+    throw new Error('Access token not found for phone number');
   }
+  await whatsapp.sendMessage(phoneNumberId, accessToken, to, message);
 }
 
 /**
- * Get access token for phone number
- */
-async function getAccessToken(phoneNumberId) {
-  try {
-    // Query database for access token
-    const pool = await database.initializeMainDb();
-    const [rows] = await pool.execute(
-      'SELECT access_token FROM whatsapp_connections WHERE phone_number_id = ? LIMIT 1',
-      [phoneNumberId]
-    );
-
-    if (rows.length > 0) {
-      // Decrypt token (in production, use proper encryption)
-      return decryptToken(rows[0].access_token);
-    }
-
-    return null;
-  } catch (error) {
-    console.error('Error getting access token:', error);
-    return null;
-  }
-}
-
-/**
- * Extract product name from message
+ * Extract product name from message (all permutations: availability, price, cost, order, etc.)
  */
 function extractProductName(message) {
-  // Simple extraction - can be enhanced with NLP
-  const lowerMessage = message.toLowerCase();
-  
-  // Common patterns
+  if (!message || typeof message !== 'string') return null;
+  const m = message.trim();
+  const lowerMessage = m.toLowerCase();
+
   const patterns = [
-    /(?:do you have|is|are|show me|i want|i need|looking for)\s+(.+?)(?:\?|$|\.)/i,
-    /(?:product|item)\s+(.+?)(?:\?|$|\.)/i
+    // Price / cost
+    /(?:how much (?:is|for|does)\s+)(?:the\s+)?(.+?)(?:\s+cost|\s+go\s+for|\?|$|\.)/i,
+    /(?:price|cost|amount)\s+(?:of|for)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
+    /(?:what('s| is) the (?:price|cost)\s+)(?:of\s+)?(?:the\s+)?(.+?)(?:\?|$|\.)/i,
+    /(?:how much (?:does)\s+)(?:the\s+)?(.+?)(?:\s+cost|\?|$|\.)/i,
+    /(?:what does)\s+(?:the\s+)?(.+?)(?:\s+cost|\s+go\s+for|\?|$|\.)/i,
+    /(?:how much for)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
+    // Availability / have / stock
+    /(?:do you have|is|are)\s+(?:there\s+)?(?:any\s+)?(?:the\s+)?(.+?)(?:\s+(?:in stock|available|\?)|$|\.)/i,
+    /(?:show me|i want|i need|looking for)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
+    /(?:product|item)\s+(.+?)(?:\?|$|\.)/i,
+    /(?:tell me about|details on|info on|what is)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
+    // Order
+    /(?:i want to buy|get me|i need)\s+(?:some\s+)?(?:the\s+)?(.+?)(?:\?|$|\.)/i,
+    /(?:order|buy)\s+(?:some\s+)?(?:the\s+)?(.+?)(?:\?|$|\.)/i
   ];
 
   for (const pattern of patterns) {
-    const match = message.match(pattern);
+    const match = m.match(pattern);
     if (match && match[1]) {
-      return match[1].trim();
+      const name = match[1].trim();
+      if (name.length > 0 && name.length < 120) return name;
     }
   }
 
@@ -328,14 +394,12 @@ function extractPaymentReference(message) {
   return null;
 }
 
-
 /**
- * Decrypt token (placeholder - implement proper encryption)
+ * Schedule follow-up (e.g. abandoned cart, payment reminder).
+ * No-op when not using Cloud Scheduler; can be wired to a job queue later.
  */
-function decryptToken(encryptedToken) {
-  // In production, use proper decryption
-  // For now, return as-is (assuming stored unencrypted for development)
-  return encryptedToken;
+async function checkAndScheduleFollowUp() {
+  // Optional: call Cloud Scheduler or internal queue when running on Google Cloud
 }
 
 module.exports = { processMessage };
