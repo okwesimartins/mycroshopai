@@ -106,13 +106,27 @@ functions.http('whatsappWebhook', async (req, res) => {
  */
 async function getTenantFromPhoneNumber(phoneNumberId) {
   try {
-    // Option 1: Query database for WhatsApp connection
+    const debugStart = Date.now();
+    console.log('[WhatsAppWebhook] Resolving tenant from phone number', {
+      phoneNumberId
+    });
+
+    // Option 1: Query database for WhatsApp connection (if DB is reachable)
     // This assumes you have a whatsapp_connections table
     const pool = await database.initializeMainDb();
+    console.log('[WhatsAppWebhook] Main DB pool acquired in', `${Date.now() - debugStart}ms`, {
+      mainDbHost: process.env.MAIN_DB_HOST,
+      mainDbName: process.env.MAIN_DB_NAME || 'mycroshop_main'
+    });
+
+    const queryStart = Date.now();
     const [rows] = await pool.execute(
       'SELECT tenant_id FROM whatsapp_connections WHERE phone_number_id = ? LIMIT 1',
       [phoneNumberId]
     );
+    console.log('[WhatsAppWebhook] Query completed in', `${Date.now() - queryStart}ms`, {
+      rowsFound: rows.length
+    });
 
     if (rows.length > 0) {
       return rows[0].tenant_id;
@@ -120,12 +134,21 @@ async function getTenantFromPhoneNumber(phoneNumberId) {
 
     // Option 2: Use environment variable for single tenant (development)
     if (process.env.DEFAULT_TENANT_ID) {
-      return parseInt(process.env.DEFAULT_TENANT_ID);
+      console.log('[WhatsAppWebhook] Falling back to DEFAULT_TENANT_ID from env');
+      return parseInt(process.env.DEFAULT_TENANT_ID, 10);
     }
 
+    console.warn('[WhatsAppWebhook] No tenant mapping and no DEFAULT_TENANT_ID configured');
     return null;
   } catch (error) {
-    console.error('Error getting tenant from phone number:', error);
+    console.error('[WhatsAppWebhook] Error getting tenant from phone number:', {
+      phoneNumberId,
+      code: error.code,
+      errno: error.errno,
+      sqlState: error.sqlState,
+      sqlMessage: error.sqlMessage,
+      message: error.message
+    });
     return null;
   }
 }
