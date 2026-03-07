@@ -5,10 +5,29 @@ const { processMessage } = require('../process-message');
 
 /**
  * WhatsApp Webhook Handler
- * Receives webhooks from Meta WhatsApp Business API
+ * Receives webhooks from Meta WhatsApp Business API.
+ *
+ * For Meta to reach this URL:
+ * 1. Cloud Run / Cloud Functions must allow unauthenticated invocations (so Meta can call without IAM).
+ * 2. If Meta never hits the URL: check firewall, URL in Meta dashboard, and HTTPS.
+ * 3. If you get 401: signature verification failed. Set META_SKIP_SIGNATURE_CHECK=true to test, or ensure raw body is available for verification.
  */
+
+function setCors(res) {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, X-Hub-Signature-256');
+}
+
 functions.http('whatsappWebhook', async (req, res) => {
+  setCors(res);
+
   try {
+    // OPTIONS (CORS preflight) – so no policy blocks Meta or proxies
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+
     // Handle webhook verification (GET request)
     if (req.method === 'GET') {
       const mode = req.query['hub.mode'];
@@ -25,44 +44,62 @@ functions.http('whatsappWebhook', async (req, res) => {
 
     // Handle webhook events (POST request)
     if (req.method === 'POST') {
-      // Basic logging to confirm that POST webhooks are reaching the service
+      const bodyPreview = req.body != null
+        ? JSON.stringify(req.body).substring(0, 1500)
+        : '(no body)';
       console.log('Incoming WhatsApp webhook', {
         method: req.method,
         path: req.path,
-        headers: {
-          'x-hub-signature-256': req.headers['x-hub-signature-256'],
-          'user-agent': req.headers['user-agent']
-        }
+        hasBody: !!req.body,
+        hasRawBody: !!(req.rawBody != null),
+        'x-hub-signature-256': req.headers['x-hub-signature-256'] ? 'present' : 'missing',
+        bodyPreview
       });
 
       const skipSignatureCheck = process.env.META_SKIP_SIGNATURE_CHECK === 'true';
 
       if (!skipSignatureCheck) {
-        // Verify webhook signature using the raw request body when available
-        const rawPayload = req.rawBody
-          ? req.rawBody.toString('utf8')
-          : JSON.stringify(req.body || {});
+        const rawPayload = req.rawBody != null
+          ? (Buffer.isBuffer(req.rawBody) ? req.rawBody.toString('utf8') : String(req.rawBody))
+          : null;
 
+        if (rawPayload == null) {
+          console.warn(
+            'Webhook signature verification: raw body not available (req.rawBody missing). ' +
+            'Verification may fail. Set META_SKIP_SIGNATURE_CHECK=true to test delivery, or configure your runtime to preserve raw body.'
+          );
+        }
+
+        const payloadForVerify = rawPayload != null ? rawPayload : JSON.stringify(req.body || {});
         const signature = req.headers['x-hub-signature-256'];
-        const isValid = whatsapp.verifyWebhookSignature(
-          signature,
-          rawPayload,
-          process.env.META_APP_SECRET
-        );
+        const isValid = signature && process.env.META_APP_SECRET &&
+          whatsapp.verifyWebhookSignature(signature, payloadForVerify, process.env.META_APP_SECRET);
 
         if (!isValid) {
-          console.error('Invalid webhook signature');
+          console.error('Invalid webhook signature (check META_APP_SECRET and raw body)');
           return res.status(401).json({ error: 'Invalid signature' });
         }
       } else {
-        console.warn('Skipping WhatsApp webhook signature verification because META_SKIP_SIGNATURE_CHECK=true');
+        console.warn('Skipping WhatsApp webhook signature verification (META_SKIP_SIGNATURE_CHECK=true)');
+      }
+
+      // Ensure we have a parsed body (some runtimes leave req.body empty and only set rawBody)
+      let payload = req.body;
+      if ((!payload || Object.keys(payload).length === 0) && req.rawBody != null) {
+        try {
+          const raw = Buffer.isBuffer(req.rawBody) ? req.rawBody.toString('utf8') : String(req.rawBody);
+          payload = raw ? JSON.parse(raw) : payload;
+        } catch (e) {
+          console.error('Failed to parse rawBody as JSON:', e.message);
+        }
       }
 
       // Parse webhook payload
-      const messageData = whatsapp.parseWebhook(req.body);
+      const messageData = whatsapp.parseWebhook(payload);
 
       if (!messageData) {
-        console.log('No message data in webhook');
+        const payloadPreview = payload != null ? JSON.stringify(payload).substring(0, 1500) : '(no payload)';
+        console.log('No message data in webhook (see parseWebhook logs above for reason). Payload used:', payloadPreview);
         return res.status(200).json({ status: 'ok' });
       }
 
