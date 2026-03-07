@@ -50,42 +50,44 @@ async function processMessage(messageData) {
     }
     console.log(`[processMessage] Processing for tenant ${tenantId}, customer ${customerPhone}:`, msgPreview.substring(0, 80));
 
-    // Check contact limit before processing (Firestore)
-    let contactLimit;
-    try {
-      contactLimit = await firestore.checkContactLimit(tenantId);
-    } catch (err) {
-      logError('contact_limit', err);
-      throw err;
-    }
-    
-    if (contactLimit.reached) {
-      // Check if this is a new contact
-      const isNewContact = !(await firestore.getConversationHistory(tenantId, customerPhone, 1)).length > 0;
-      
-      if (isNewContact) {
-        // Block new contacts if limit reached
-        const upgradeMessage = contactPricing.getUpgradeMessage(contactLimit.count, contactLimit.limit);
-        await sendWhatsAppResponse(
-          phoneNumberId,
-          customerPhone,
-          `Sorry, you've reached your contact limit (${contactLimit.count}/${contactLimit.limit}). ` +
-          `Please upgrade your plan to continue receiving messages from new customers. ` +
-          `Contact support for assistance.`,
-          accessToken
-        );
-        return;
+    // Check contact limit before processing (Firestore) – skip if Firestore not configured
+    if (typeof firestore.checkContactLimit === 'function') {
+      let contactLimit;
+      try {
+        contactLimit = await firestore.checkContactLimit(tenantId);
+      } catch (err) {
+        logError('contact_limit', err);
+        throw err;
       }
-      // Allow existing contacts to continue messaging
+
+      if (contactLimit.reached) {
+        const isNewContact = typeof firestore.getConversationHistory === 'function'
+          ? !(await firestore.getConversationHistory(tenantId, customerPhone, 1)).length > 0
+          : true;
+        if (isNewContact) {
+          const upgradeMessage = contactPricing.getUpgradeMessage(contactLimit.count, contactLimit.limit);
+          await sendWhatsAppResponse(
+            phoneNumberId,
+            customerPhone,
+            `Sorry, you've reached your contact limit (${contactLimit.count}/${contactLimit.limit}). ` +
+            `Please upgrade your plan to continue receiving messages from new customers. ` +
+            `Contact support for assistance.`,
+            accessToken
+          );
+          return;
+        }
+      }
     }
 
-    // Get conversation history from Firestore
-    let conversationHistory;
-    try {
-      conversationHistory = await firestore.getConversationHistory(tenantId, customerPhone);
-    } catch (err) {
-      logError('conversation_history', err);
-      throw err;
+    // Get conversation history from Firestore (empty if Firestore not configured)
+    let conversationHistory = [];
+    if (typeof firestore.getConversationHistory === 'function') {
+      try {
+        conversationHistory = await firestore.getConversationHistory(tenantId, customerPhone);
+      } catch (err) {
+        logError('conversation_history', err);
+        throw err;
+      }
     }
 
     // Process message with Gemini AI
@@ -136,13 +138,15 @@ async function processMessage(messageData) {
       throw err;
     }
 
-    // Save conversation history to Firestore
-    try {
-      await firestore.saveMessage(tenantId, customerPhone, 'user', message, messageId);
-      await firestore.saveMessage(tenantId, customerPhone, 'assistant', finalResponse);
-    } catch (err) {
-      logError('save_history', err);
-      // Don't throw - message was already sent; log and continue
+    // Save conversation history to Firestore (no-op if Firestore not configured)
+    if (typeof firestore.saveMessage === 'function') {
+      try {
+        await firestore.saveMessage(tenantId, customerPhone, 'user', message, messageId);
+        await firestore.saveMessage(tenantId, customerPhone, 'assistant', finalResponse);
+      } catch (err) {
+        logError('save_history', err);
+        // Don't throw - message was already sent; log and continue
+      }
     }
 
     // Check if follow-up should be scheduled (like a human sales agent would)
