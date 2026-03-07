@@ -44,16 +44,21 @@ functions.http('whatsappWebhook', async (req, res) => {
 
     // Handle webhook events (POST request)
     if (req.method === 'POST') {
-      const bodyPreview = req.body != null
-        ? JSON.stringify(req.body).substring(0, 1500)
-        : '(no body)';
-      console.log('Incoming WhatsApp webhook', {
-        method: req.method,
-        path: req.path,
-        hasBody: !!req.body,
+      // Ensure we have a parsed body first (needed for signature + event detection)
+      let payload = req.body;
+      if ((!payload || Object.keys(payload).length === 0) && req.rawBody != null) {
+        try {
+          const raw = Buffer.isBuffer(req.rawBody) ? req.rawBody.toString('utf8') : String(req.rawBody);
+          payload = raw ? JSON.parse(raw) : payload;
+        } catch (e) {
+          console.error('[webhook] Failed to parse rawBody as JSON:', e.message);
+        }
+      }
+      const hasBody = !!(payload && Object.keys(payload).length > 0);
+      console.log('[webhook] POST received', {
+        hasBody,
         hasRawBody: !!(req.rawBody != null),
-        'x-hub-signature-256': req.headers['x-hub-signature-256'] ? 'present' : 'missing',
-        bodyPreview
+        'x-hub-signature-256': req.headers['x-hub-signature-256'] ? 'present' : 'missing'
       });
 
       const skipSignatureCheck = process.env.META_SKIP_SIGNATURE_CHECK === 'true';
@@ -70,7 +75,7 @@ functions.http('whatsappWebhook', async (req, res) => {
           );
         }
 
-        const payloadForVerify = rawPayload != null ? rawPayload : JSON.stringify(req.body || {});
+        const payloadForVerify = rawPayload != null ? rawPayload : JSON.stringify(payload || {});
         const signature = req.headers['x-hub-signature-256'];
         const isValid = signature && process.env.META_APP_SECRET &&
           whatsapp.verifyWebhookSignature(signature, payloadForVerify, process.env.META_APP_SECRET);
@@ -83,27 +88,33 @@ functions.http('whatsappWebhook', async (req, res) => {
         console.warn('Skipping WhatsApp webhook signature verification (META_SKIP_SIGNATURE_CHECK=true)');
       }
 
-      // Ensure we have a parsed body (some runtimes leave req.body empty and only set rawBody)
-      let payload = req.body;
-      if ((!payload || Object.keys(payload).length === 0) && req.rawBody != null) {
-        try {
-          const raw = Buffer.isBuffer(req.rawBody) ? req.rawBody.toString('utf8') : String(req.rawBody);
-          payload = raw ? JSON.parse(raw) : payload;
-        } catch (e) {
-          console.error('Failed to parse rawBody as JSON:', e.message);
+      // Detect event type: only process incoming user messages; ignore status (read/delivered/sent) and echoes
+      const entry = payload?.entry?.[0];
+      const change = entry?.changes?.[0];
+      const value = change?.value;
+      const hasMessages = !!(value?.messages?.length);
+      const hasStatuses = !!(value?.statuses?.length);
+      const hasEchoes = !!(value?.message_echoes?.length);
+
+      if (!hasMessages) {
+        if (hasStatuses) {
+          const status = value.statuses[0]?.status || 'unknown';
+          console.log('[webhook] Ignoring status event:', status, '(not an incoming message)');
+        } else if (hasEchoes) {
+          console.log('[webhook] Ignoring message_echo event (outgoing message echo)');
+        } else {
+          console.log('[webhook] No message data (no messages in payload). entry:', !!entry, 'change.field:', change?.field);
         }
-      }
-
-      // Parse webhook payload
-      const messageData = whatsapp.parseWebhook(payload);
-
-      if (!messageData) {
-        const payloadPreview = payload != null ? JSON.stringify(payload).substring(0, 1500) : '(no payload)';
-        console.log('No message data in webhook (see parseWebhook logs above for reason). Payload used:', payloadPreview);
         return res.status(200).json({ status: 'ok' });
       }
 
-      console.log('Received message:', messageData);
+      const messageData = whatsapp.parseWebhook(payload);
+      if (!messageData) {
+        console.error('[webhook] parseWebhook returned null despite hasMessages=true. Payload keys:', payload ? Object.keys(payload) : []);
+        return res.status(200).json({ status: 'ok' });
+      }
+
+      console.log('[webhook] Incoming message:', { from: messageData.from, text: messageData.text?.substring(0, 100), phoneNumberId: messageData.phoneNumberId });
 
       // Resolve tenant via backend API (no DB from Cloud)
       const tenantContext = await backendApi.resolveTenant(messageData.phoneNumberId);
@@ -133,7 +144,8 @@ functions.http('whatsappWebhook', async (req, res) => {
         messageId: messageData.messageId,
         phoneNumberId: messageData.phoneNumberId
       }).catch(error => {
-        console.error('Error processing message:', error);
+        console.error('[webhook] processMessage failed:', error?.message || error);
+        if (error?.stack) console.error('[webhook] processMessage stack:', error.stack);
       });
 
       // Return 200 immediately to acknowledge receipt

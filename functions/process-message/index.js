@@ -5,8 +5,8 @@ const firestore = require('../../lib/firestore');
 const contactPricing = require('../../lib/contact-pricing');
 const payments = require('../../lib/payments'); // for formatPaymentConfirmation only
 
-// Initialize Gemini AI
-const ai = new gemini(process.env.GEMINI_API_KEY);
+// Initialize Gemini AI (key checked at first use to avoid startup failure)
+const ai = new gemini(process.env.GEMINI_API_KEY || '');
 
 /**
  * Process incoming WhatsApp message
@@ -28,11 +28,36 @@ async function processMessage(messageData) {
   const subscriptionPlan = subscriptionPlanFromWebhook || 'enterprise';
   const storeNameResolved = storeName || 'our store';
 
+  const logError = (step, err) => {
+    console.error(`[processMessage] ERROR at ${step}:`, err?.message || err);
+    if (err?.stack) {
+      console.error(`[processMessage] ${step} stack:`, err.stack);
+    }
+    if (err?.response?.data) {
+      console.error(`[processMessage] ${step} response:`, JSON.stringify(err.response.data).substring(0, 500));
+    }
+  };
+
   try {
-    console.log(`Processing message for tenant ${tenantId}:`, message);
+    if (!process.env.GEMINI_API_KEY) {
+      console.error('[processMessage] GEMINI_API_KEY is not set');
+      throw new Error('GEMINI_API_KEY is not set');
+    }
+    const msgPreview = (message || '').trim();
+    if (!msgPreview) {
+      console.log('[processMessage] Empty message, skipping');
+      return;
+    }
+    console.log(`[processMessage] Processing for tenant ${tenantId}, customer ${customerPhone}:`, msgPreview.substring(0, 80));
 
     // Check contact limit before processing (Firestore)
-    const contactLimit = await firestore.checkContactLimit(tenantId);
+    let contactLimit;
+    try {
+      contactLimit = await firestore.checkContactLimit(tenantId);
+    } catch (err) {
+      logError('contact_limit', err);
+      throw err;
+    }
     
     if (contactLimit.reached) {
       // Check if this is a new contact
@@ -55,7 +80,13 @@ async function processMessage(messageData) {
     }
 
     // Get conversation history from Firestore
-    const conversationHistory = await firestore.getConversationHistory(tenantId, customerPhone);
+    let conversationHistory;
+    try {
+      conversationHistory = await firestore.getConversationHistory(tenantId, customerPhone);
+    } catch (err) {
+      logError('conversation_history', err);
+      throw err;
+    }
 
     // Process message with Gemini AI
     const context = {
@@ -66,12 +97,19 @@ async function processMessage(messageData) {
       conversation_history: conversationHistory
     };
 
-    const aiResponse = await ai.processMessage(message, context);
+    let aiResponse;
+    try {
+      aiResponse = await ai.processMessage(message, context);
+    } catch (err) {
+      logError('ai_processMessage', err);
+      throw err;
+    }
 
-    // Handle AI actions (via backend API)
+    // Handle AI actions (via backend API) – intent drives which API we call
     let finalResponse = aiResponse.text;
 
     if (aiResponse.actions && aiResponse.actions.length > 0) {
+      console.log('[processMessage] Intent -> API actions:', aiResponse.actions.map(a => a.type).join(', '));
       for (const action of aiResponse.actions) {
         const actionResult = await handleAction(action, {
           tenantId,
@@ -91,17 +129,31 @@ async function processMessage(messageData) {
     }
 
     // Send response via WhatsApp (using token from resolve-tenant)
-    await sendWhatsAppResponse(phoneNumberId, customerPhone, finalResponse, accessToken);
+    try {
+      await sendWhatsAppResponse(phoneNumberId, customerPhone, finalResponse, accessToken);
+    } catch (err) {
+      logError('send_whatsapp_response', err);
+      throw err;
+    }
 
     // Save conversation history to Firestore
-    await firestore.saveMessage(tenantId, customerPhone, 'user', message, messageId);
-    await firestore.saveMessage(tenantId, customerPhone, 'assistant', finalResponse);
+    try {
+      await firestore.saveMessage(tenantId, customerPhone, 'user', message, messageId);
+      await firestore.saveMessage(tenantId, customerPhone, 'assistant', finalResponse);
+    } catch (err) {
+      logError('save_history', err);
+      // Don't throw - message was already sent; log and continue
+    }
 
     // Check if follow-up should be scheduled (like a human sales agent would)
     await checkAndScheduleFollowUp(tenantId, customerPhone, message, finalResponse, conversationHistory);
 
   } catch (error) {
-    console.error('Error processing message:', error);
+    console.error('[processMessage] FAILED:', error?.message || error);
+    console.error('[processMessage] Full error:', error);
+    if (error?.stack) {
+      console.error('[processMessage] Stack:', error.stack);
+    }
     
     // Send error message to customer
     try {
@@ -112,7 +164,7 @@ async function processMessage(messageData) {
         accessToken
       );
     } catch (sendError) {
-      console.error('Error sending error message:', sendError);
+      console.error('[processMessage] Error sending fallback message to user:', sendError?.message || sendError);
     }
   }
 }
