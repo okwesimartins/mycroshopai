@@ -196,6 +196,9 @@ async function handleAction(action, ctx) {
       case 'list_inventory':
         return await handleListInventory(ctx, action.share_media === true);
 
+      case 'show_variations':
+        return await handleShowVariations(ctx);
+
       case 'create_order':
         return await handleOrderCreation(tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory);
 
@@ -230,9 +233,10 @@ async function handleInventoryQuery(tenantId, subscriptionPlan, message, intent)
     if (result.exists && result.product) {
       const p = result.product;
       const stock = p.stock != null ? p.stock : 0;
+      const priceStr = p.price != null ? formatNaira(p.price) : (p.variations ? 'see variations' : '—');
       return `✅ ${result.message || 'Product found'}\n\n` +
              `Product: ${p.name}\n` +
-             `Price: ₦${parseFloat(p.price || 0).toLocaleString()}\n` +
+             `Price: ${priceStr}\n` +
              `Stock: ${stock} available\n\n` +
              `Would you like to place an order?`;
     }
@@ -241,6 +245,36 @@ async function handleInventoryQuery(tenantId, subscriptionPlan, message, intent)
     console.error('Error handling inventory query:', error);
     return 'Sorry, I encountered an error checking availability. Please try again.';
   }
+}
+
+/**
+ * Handle "show variations" – use last product from conversation and return its variation options.
+ */
+async function handleShowVariations(ctx) {
+  const { tenantId, subscriptionPlan, conversationHistory = [] } = ctx;
+  const productName = extractLastProductFromConversation(conversationHistory) || extractProductName(ctx.message);
+  if (!productName) {
+    return null;
+  }
+  const listResult = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 1 });
+  if (!listResult || !listResult.products || listResult.products.length === 0) {
+    return `We don't have "${productName}" in the catalog. Which product did you mean?`;
+  }
+  const p = listResult.products[0];
+  if (!p.variations || !p.variations.length) {
+    return `${p.name} doesn't have options/variations – it's a single option. Price: ${formatNaira(p.price || 0)}. Want to order?`;
+  }
+  let text = `${p.name} – options:\n\n`;
+  for (const v of p.variations) {
+    const opts = (v.options || []).filter(o => o.is_available !== false);
+    for (const o of opts) {
+      const price = parseFloat(o.price_adjustment) || 0;
+      const stock = o.stock != null ? ` (${o.stock} in stock)` : '';
+      text += `• ${o.option_display_name || o.option_value} – ${formatNaira(price)}${stock}\n`;
+    }
+  }
+  text += '\nWhich option do you want?';
+  return text;
 }
 
 /**
@@ -259,14 +293,14 @@ function formatProductPriceAndStock(p) {
     }
     if (minPrice !== null) {
       const stockStr = totalStock > 0 ? ` (${totalStock} in stock)` : '';
-      return { line: `from ₦${minPrice.toLocaleString()}${stockStr}`, priceNum: minPrice };
+      return { line: `from ${formatNaira(minPrice)}${stockStr}`, priceNum: minPrice };
     }
     const varNames = p.variations.map(v => v.variation_name).filter(Boolean).join(', ') || 'options';
     return { line: `various ${varNames}`, priceNum: 0 };
   }
   const price = parseFloat(p.price || 0);
   const stockStr = p.stock != null ? ` (${p.stock} in stock)` : '';
-  return { line: `₦${price.toLocaleString()}${stockStr}`, priceNum: price };
+  return { line: `${formatNaira(price)}${stockStr}`, priceNum: price };
 }
 
 async function handleListInventory(ctx, shareMedia) {
@@ -274,9 +308,9 @@ async function handleListInventory(ctx, shareMedia) {
   try {
     let search = extractProductName(message) || extractSearchTerm(message);
     if (isMediaOnlyWord(search)) search = undefined;
-    if (!search && isGenericPictureRequest(message)) {
-      const fromHistory = extractLastMentionedProductFromHistory(conversationHistory);
-      if (fromHistory) search = fromHistory;
+    if (isContextReference(search)) search = undefined;
+    if (!search && (isGenericPictureRequest(message) || isContextReference(extractProductName(message) || extractSearchTerm(message)))) {
+      search = extractLastProductFromConversation(conversationHistory) || extractLastMentionedProductFromHistory(conversationHistory) || undefined;
     }
     const listResult = await backendApi.listProducts(tenantId, subscriptionPlan, {
       search: search || undefined,
@@ -441,25 +475,51 @@ async function sendWhatsAppResponse(phoneNumberId, to, message, accessToken) {
   await whatsapp.sendMessage(phoneNumberId, accessToken, to, message);
 }
 
+/** Format amount as Naira (₦) with thousands separator and optional decimals */
+function formatNaira(amount) {
+  const n = Number(amount);
+  if (isNaN(n)) return '₦0';
+  return '₦' + n.toLocaleString('en-NG', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+}
+
 /** Words that mean "photos/pictures" — never use these as product search terms */
 const MEDIA_WORDS = new Set(['image', 'images', 'picture', 'pictures', 'photo', 'photos', 'pic', 'pics']);
+
+/** Phrases that refer to "what we were just discussing" — use chat history, not as search term */
+const CONTEXT_REFERENCE_PHRASES = new Set([
+  'ones you have', 'the ones you have', 'what you have', 'what you showed', 'the ones you showed',
+  'that one', 'those', 'the ones', 'your options', 'your selection', 'what you got', 'the options'
+]);
 
 function isMediaOnlyWord(term) {
   if (!term || typeof term !== 'string') return false;
   return MEDIA_WORDS.has(term.trim().toLowerCase());
 }
 
-/** Check if message is a generic "show picture" with no product name (use chat history for context) */
+function isContextReference(term) {
+  if (!term || typeof term !== 'string') return false;
+  const t = term.trim().toLowerCase();
+  if (CONTEXT_REFERENCE_PHRASES.has(t)) return true;
+  if (/^(the\s+)?ones\s+(you\s+)?have$/i.test(t)) return true;
+  if (/^what\s+you\s+(have|showed|got)$/i.test(t)) return true;
+  if (/\bones\s+you\s+have\b/i.test(t) || /\bwhat\s+you\s+have\b/i.test(t)) return true;
+  return false;
+}
+
+/** Check if message is a generic "show picture" or "show me what you have" (use chat history) */
 function isGenericPictureRequest(message) {
   if (!message || typeof message !== 'string') return false;
   const m = message.trim().toLowerCase();
-  return /^(yes\s+)?(let me see|show me|send me|i want to see)\s+(?:the\s+)?(picture|image|photo)s?\.?$/i.test(m) ||
-    /^(yes\s+)?(picture|image|photo)s?\.?$/i.test(m) ||
-    /^(\s*yes\s*)$/i.test(m);
+  if (/^(\s*yes\s*)$/i.test(m)) return true;
+  if (/^(yes\s+)?(let me see|show me|send me|i want to see)\s+(?:the\s+)?(picture|image|photo)s?\.?$/i.test(m)) return true;
+  if (/^(yes\s+)?(picture|image|photo)s?\.?$/i.test(m)) return true;
+  if (/(?:let me see|show me)\s+(?:the\s+)?(?:images?|pictures?|photos?)\s+of\s+(?:the\s+)?ones\s+you\s+have/i.test(m)) return true;
+  if (/(?:let me see|show me)\s+(?:the\s+)?(?:images?|pictures?)\s+of\s+what\s+you\s+have/i.test(m)) return true;
+  return false;
 }
 
 /**
- * Get the last product name mentioned by the user in conversation history (for context when they say "show picture").
+ * Get the last product name mentioned by the user in conversation history.
  */
 function extractLastMentionedProductFromHistory(conversationHistory) {
   if (!Array.isArray(conversationHistory) || conversationHistory.length === 0) return null;
@@ -467,7 +527,29 @@ function extractLastMentionedProductFromHistory(conversationHistory) {
   for (const msg of recent) {
     if (msg.role === 'user' && msg.text) {
       const name = extractProductName(msg.text);
-      if (name) return name;
+      if (name && !isContextReference(name) && !isMediaOnlyWord(name)) return name;
+    }
+  }
+  return null;
+}
+
+/**
+ * Get the last product name from the whole conversation (user or assistant), e.g. for "show variations".
+ */
+function extractLastProductFromConversation(conversationHistory) {
+  const fromUser = extractLastMentionedProductFromHistory(conversationHistory);
+  if (fromUser) return fromUser;
+  if (!Array.isArray(conversationHistory) || conversationHistory.length === 0) return null;
+  const recent = conversationHistory.slice(-6).reverse();
+  for (const msg of recent) {
+    if (msg.role === 'assistant' && msg.text) {
+      const t = msg.text;
+      const m = t.match(/(?:Here's?|Sending you)\s+([^:!.\n]+?)(?:\s*[:\-]|!|\.|\n|$)/i);
+      if (m && m[1]) return m[1].trim();
+      const m2 = t.match(/^\s*\d+\.\s+([^–\-]+?)\s+[–\-]\s+(?:from\s+)?₦/m);
+      if (m2 && m2[1]) return m2[1].trim();
+      const m3 = t.match(/([A-Za-z0-9\s]+?)\s+[–\-]\s+from\s+₦/);
+      if (m3 && m3[1]) return m3[1].trim();
     }
   }
   return null;
