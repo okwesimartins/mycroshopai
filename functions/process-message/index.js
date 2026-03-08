@@ -246,11 +246,38 @@ async function handleInventoryQuery(tenantId, subscriptionPlan, message, intent)
 /**
  * Handle list inventory / catalog (via backend API). Optionally send product images via WhatsApp.
  */
+function formatProductPriceAndStock(p) {
+  if (p.variations && Array.isArray(p.variations) && p.variations.length > 0) {
+    let minPrice = null;
+    let totalStock = 0;
+    for (const v of p.variations) {
+      for (const opt of v.options || []) {
+        const adj = parseFloat(opt.price_adjustment);
+        if (!isNaN(adj) && (minPrice === null || adj < minPrice)) minPrice = adj;
+        if (opt.stock != null) totalStock += Number(opt.stock);
+      }
+    }
+    if (minPrice !== null) {
+      const stockStr = totalStock > 0 ? ` (${totalStock} in stock)` : '';
+      return { line: `from ₦${minPrice.toLocaleString()}${stockStr}`, priceNum: minPrice };
+    }
+    const varNames = p.variations.map(v => v.variation_name).filter(Boolean).join(', ') || 'options';
+    return { line: `various ${varNames}`, priceNum: 0 };
+  }
+  const price = parseFloat(p.price || 0);
+  const stockStr = p.stock != null ? ` (${p.stock} in stock)` : '';
+  return { line: `₦${price.toLocaleString()}${stockStr}`, priceNum: price };
+}
+
 async function handleListInventory(ctx, shareMedia) {
-  const { tenantId, subscriptionPlan, message, accessToken, phoneNumberId, customerPhone } = ctx;
+  const { tenantId, subscriptionPlan, message, accessToken, phoneNumberId, customerPhone, conversationHistory = [] } = ctx;
   try {
     let search = extractProductName(message) || extractSearchTerm(message);
     if (isMediaOnlyWord(search)) search = undefined;
+    if (!search && isGenericPictureRequest(message)) {
+      const fromHistory = extractLastMentionedProductFromHistory(conversationHistory);
+      if (fromHistory) search = fromHistory;
+    }
     const listResult = await backendApi.listProducts(tenantId, subscriptionPlan, {
       search: search || undefined,
       limit: search ? 10 : 15
@@ -276,7 +303,8 @@ async function handleListInventory(ctx, shareMedia) {
       const toSend = withImages.slice(0, maxImages);
       for (const p of toSend) {
         const imageUrl = toFullImageUrl(p.image_url);
-        const caption = `${p.name} – ₦${parseFloat(p.price || 0).toLocaleString()}${p.stock != null ? ` (${p.stock} in stock)` : ''}`;
+        const { line } = formatProductPriceAndStock(p);
+        const caption = `${p.name} – ${line}`;
         try {
           await whatsapp.sendImage(phoneNumberId, accessToken, customerPhone, imageUrl, caption);
         } catch (err) {
@@ -290,9 +318,8 @@ async function handleListInventory(ctx, shareMedia) {
       ? `📦 Here’s ${products[0].name}:\n\n`
       : `📦 Here are our products${search ? ` matching "${search}"` : ''}:\n\n`;
     products.forEach((p, i) => {
-      text += `${i + 1}. ${p.name} – ₦${parseFloat(p.price || 0).toLocaleString()}`;
-      if (p.stock != null) text += ` (${p.stock} in stock)`;
-      text += '\n';
+      const { line } = formatProductPriceAndStock(p);
+      text += `${i + 1}. ${p.name} – ${line}\n`;
     });
     text += '\nWould you like details on any product or to place an order?';
     return text;
@@ -422,6 +449,30 @@ function isMediaOnlyWord(term) {
   return MEDIA_WORDS.has(term.trim().toLowerCase());
 }
 
+/** Check if message is a generic "show picture" with no product name (use chat history for context) */
+function isGenericPictureRequest(message) {
+  if (!message || typeof message !== 'string') return false;
+  const m = message.trim().toLowerCase();
+  return /^(yes\s+)?(let me see|show me|send me|i want to see)\s+(?:the\s+)?(picture|image|photo)s?\.?$/i.test(m) ||
+    /^(yes\s+)?(picture|image|photo)s?\.?$/i.test(m) ||
+    /^(\s*yes\s*)$/i.test(m);
+}
+
+/**
+ * Get the last product name mentioned by the user in conversation history (for context when they say "show picture").
+ */
+function extractLastMentionedProductFromHistory(conversationHistory) {
+  if (!Array.isArray(conversationHistory) || conversationHistory.length === 0) return null;
+  const recent = conversationHistory.slice(-8).reverse();
+  for (const msg of recent) {
+    if (msg.role === 'user' && msg.text) {
+      const name = extractProductName(msg.text);
+      if (name) return name;
+    }
+  }
+  return null;
+}
+
 /**
  * Extract product name from message (all permutations: availability, price, cost, order, image of X, etc.)
  */
@@ -433,6 +484,8 @@ function extractProductName(message) {
     // "image/picture/photo of X" — user wants to see a specific product's image (must come first)
     /(?:can i see|show me|send me|i want to see|let me see|send)\s+(?:the\s+)?(?:product\s+)?(?:image|picture|photo|pic)s?\s+(?:of\s+)(?:the\s+)?(.+?)(?:\?|$|\.)/i,
     /(?:image|picture|photo|pic)s?\s+(?:of\s+)(?:the\s+)?(.+?)(?:\?|$|\.)/i,
+    // "let me see X" / "show me X" — product by name (must check inventory; do not assume by name)
+    /(?:let me see|show me)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
     // Price / cost
     /(?:how much (?:is|for|does)\s+)(?:the\s+)?(.+?)(?:\s+cost|\s+go\s+for|\?|$|\.)/i,
     /(?:price|cost|amount)\s+(?:of|for)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
