@@ -138,7 +138,7 @@ async function processMessage(messageData) {
       .replace(/\s*`[^`]*`\s*/g, ' ')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
-    if (cleaned.length > 0) finalResponse = humanizeOutgoingReply(cleaned, conversationHistory, message);
+    if (cleaned.length > 0) finalResponse = cleaned;
 
     // Send response via WhatsApp (using token from resolve-tenant)
     try {
@@ -219,37 +219,31 @@ async function handleAction(action, ctx) {
  */
 async function handleInventoryQuery(tenantId, subscriptionPlan, message, intent) {
   try {
-    const productName = normalizeSearchTerm(extractProductName(message) || extractSearchTerm(message) || '');
+    const productName = extractProductName(message);
     if (!productName) {
-      if (intent === 'price') return 'Which product should I check the price for?';
-      return 'Tell me the product name and I’ll check it for you.';
+      if (intent === 'price') return null;
+      return 'Could you please specify which product you\'re looking for?';
     }
 
     const result = await backendApi.checkProduct(tenantId, productName, subscriptionPlan);
     if (!result) {
-      return 'I couldn’t check that right now. Please try again in a moment.';
+      return 'Sorry, I couldn\'t check availability. Please try again.';
     }
 
     if (result.exists && result.product) {
       const p = result.product;
-      const stock = p.stock != null ? Number(p.stock) : null;
-      const priceStr = p.price != null ? formatNaira(p.price) : null;
-      const hasVariations = Array.isArray(p.variations) && p.variations.length > 0;
-
-      if (intent === 'price') {
-        return `${p.name}${priceStr ? ` is ${priceStr}` : hasVariations ? ' has a few price options depending on the variation' : ' is available'}.${stock != null ? stock > 0 ? ` We have ${stock} available right now.` : ' It’s currently out of stock.' : ''} ${hasVariations ? 'Want me to show you the options too?' : 'Want me to send a photo or help you order it?'}`.trim();
-      }
-
-      if (stock != null && stock <= 0) {
-        return `${p.name} is in our catalog, but it’s currently out of stock.${priceStr ? ` Last listed price is ${priceStr}.` : ''} Want me to show you something similar instead?`;
-      }
-
-      return `Yes, we have ${p.name}.${priceStr ? ` It’s ${priceStr}.` : ''}${stock != null ? ` We currently have ${stock} available.` : ''} ${hasVariations ? 'Want the options as well?' : 'Want me to send a photo or help you place the order?'}`.trim();
+      const stock = p.stock != null ? p.stock : 0;
+      const priceStr = p.price != null ? formatNaira(p.price) : (p.variations ? 'see variations' : '—');
+      return `✅ ${result.message || 'Product found'}\n\n` +
+             `Product: ${p.name}\n` +
+             `Price: ${priceStr}\n` +
+             `Stock: ${stock} available\n\n` +
+             `Would you like to place an order?`;
     }
-    return `I couldn’t find "${productName}" in the catalog right now. Want me to show you similar options or the full catalog instead?`;
+    return `❌ ${result.message || 'Product not found'}`;
   } catch (error) {
     console.error('Error handling inventory query:', error);
-    return 'I ran into a problem checking that right now. Please try again.';
+    return 'Sorry, I encountered an error checking availability. Please try again.';
   }
 }
 
@@ -257,51 +251,31 @@ async function handleInventoryQuery(tenantId, subscriptionPlan, message, intent)
  * Handle "show variations" – use last product from conversation and return its variation options.
  */
 async function handleShowVariations(ctx) {
-  const { tenantId, subscriptionPlan, conversationHistory = [], message = '' } = ctx;
-  const lastCatalogItems = getRecentAssistantCatalogItems(conversationHistory);
-  const explicitProduct = normalizeSearchTerm(extractProductName(message) || '');
-  let productName = explicitProduct;
-
+  const { tenantId, subscriptionPlan, conversationHistory = [] } = ctx;
+  const productName = extractLastProductFromConversation(conversationHistory) || extractProductName(ctx.message);
   if (!productName) {
-    if (lastCatalogItems.length === 1) {
-      productName = lastCatalogItems[0];
-    } else if (lastCatalogItems.length > 1) {
-      const optionsPreview = lastCatalogItems.slice(0, 5).map(name => `• ${name}`).join('\n');
-      return `Sure — which one do you want the options for?\n\n${optionsPreview}`;
-    } else {
-      productName = normalizeSearchTerm(extractLastProductFromConversation(conversationHistory) || '');
-    }
+    return null;
   }
-
-  if (!productName) {
-    return 'Sure — send the product name and I’ll show you the available options.';
-  }
-
-  const listResult = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 1 });
+  const listResult = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 5 });
   if (!listResult || !listResult.products || listResult.products.length === 0) {
-    return `I couldn’t find ${productName} in the catalog right now. Send the exact product name and I’ll check again.`;
+    return null;
   }
-
-  const p = listResult.products[0];
+  const p = listResult.products.find(pr => pr.name && pr.name.toLowerCase().includes(productName.toLowerCase())) || listResult.products[0];
   if (!p.variations || !p.variations.length) {
-    return `${p.name} doesn’t have separate variations — it’s a single option${p.price != null ? ` at ${formatNaira(p.price)}` : ''}. Want me to help you order it?`;
+    return `${p.name} doesn't have options – single price ${formatNaira(p.price || 0)}. Want to order?`;
   }
-
-  let text = `Here are the options for ${p.name}:\n\n`;
+  let text = `${p.name} – what we have:\n\n`;
   for (const v of p.variations) {
-    const label = v.variation_name || 'Options';
-    text += `${label}:\n`;
     const opts = (v.options || []).filter(o => o.is_available !== false);
+    if (opts.length && v.variation_name) text += `${v.variation_name}:\n`;
     for (const o of opts) {
-      const optionName = o.option_display_name || o.option_value || 'Option';
-      const price = getVariationPrice(p, o);
-      const stockNote = o.stock != null ? (Number(o.stock) > 0 ? ` (${o.stock} in stock)` : ' (out of stock)') : '';
-      text += `• ${optionName}${price != null ? ` – ${formatNaira(price)}` : ''}${stockNote}\n`;
+      const price = parseFloat(o.price_adjustment) || 0;
+      const stock = o.stock != null ? ` (${o.stock} left)` : '';
+      text += `• ${o.option_display_name || o.option_value} – ${formatNaira(price)}${stock}\n`;
     }
-    text += '\n';
   }
-  text += 'Send the exact option you want and I’ll help you place the order.';
-  return text.trim();
+  text += '\nWhich one?';
+  return text;
 }
 
 /**
@@ -333,41 +307,22 @@ function formatProductPriceAndStock(p) {
 async function handleListInventory(ctx, shareMedia) {
   const { tenantId, subscriptionPlan, message, accessToken, phoneNumberId, customerPhone, conversationHistory = [] } = ctx;
   try {
-    let rawSearch = extractProductName(message) || extractSearchTerm(message);
-    let search = normalizeSearchTerm(rawSearch || '');
-
-    if ((!search || isContextReference(search)) && (isGenericPictureRequest(message) || isContextReference(rawSearch || ''))) {
-      const lastCatalogItems = getRecentAssistantCatalogItems(conversationHistory);
-      if (lastCatalogItems.length === 1) {
-        search = lastCatalogItems[0];
-      } else {
-        search = normalizeSearchTerm(extractLastProductFromConversation(conversationHistory) || extractLastMentionedProductFromHistory(conversationHistory) || '');
-      }
+    let search = extractProductName(message) || extractSearchTerm(message);
+    search = normalizeSearchTerm(search);
+    if (isMediaOnlyWord(search)) search = undefined;
+    if (isContextReference(search)) search = undefined;
+    if (!search && (isGenericPictureRequest(message) || isContextReference(extractProductName(message) || extractSearchTerm(message)))) {
+      search = extractLastProductFromConversation(conversationHistory) || extractLastMentionedProductFromHistory(conversationHistory) || undefined;
     }
-
-    const attempts = [];
-    if (search) attempts.push(search);
-    const relaxed = relaxSearchTerm(search);
-    if (relaxed && !attempts.includes(relaxed)) attempts.push(relaxed);
-    if (attempts.length === 0) attempts.push(undefined);
-
-    let listResult = null;
-    let matchedSearch = search;
-    for (const candidate of attempts) {
-      listResult = await backendApi.listProducts(tenantId, subscriptionPlan, {
-        search: candidate || undefined,
-        limit: candidate ? 10 : 15
-      });
-      if (listResult && Array.isArray(listResult.products) && listResult.products.length > 0) {
-        matchedSearch = candidate;
-        break;
-      }
-    }
+    const listResult = await backendApi.listProducts(tenantId, subscriptionPlan, {
+      search: search || undefined,
+      limit: search ? 10 : 15
+    });
 
     if (!listResult || !listResult.products || listResult.products.length === 0) {
       return search
-        ? `I couldn’t find anything matching "${search}" right now. Want me to show you the full catalog instead?`
-        : 'We don’t have any products in the catalog right now. Check back later.';
+        ? `We don't have any products matching "${search}" right now. Try another search or ask for our full catalog.`
+        : 'We don\'t have any products in the catalog at the moment. Check back later!';
     }
 
     const products = listResult.products;
@@ -394,105 +349,20 @@ async function handleListInventory(ctx, shareMedia) {
       }
     }
 
-    const singleProduct = products.length === 1 && !!matchedSearch;
-    let text = '';
-
-    if (singleProduct) {
-      const p = products[0];
-      const { line } = formatProductPriceAndStock(p);
-      text = `${shareMedia && withImages.length ? `I just sent ${p.name}.` : `Here’s ${p.name}.`}\n\n${p.name} – ${line}\n\n${p.variations && p.variations.length ? 'Want the variations too?' : 'Want me to help you place the order?'}`;
-      return text;
-    }
-
-    text += shareMedia && withImages.length
-      ? `I’ve sent the ${matchedSearch ? matchedSearch : 'options'} we have above.\n\n`
-      : `Here are the ${matchedSearch ? matchedSearch : 'products'} we have right now:\n\n`;
-
+    const singleProduct = products.length === 1 && search;
+    let text = singleProduct
+      ? `📦 Here’s ${products[0].name}:\n\n`
+      : `📦 Here are our products${search ? ` matching "${search}"` : ''}:\n\n`;
     products.forEach((p, i) => {
       const { line } = formatProductPriceAndStock(p);
       text += `${i + 1}. ${p.name} – ${line}\n`;
     });
-
-    text += '\nIf any one catches your eye, send the name and I’ll show the price, photo, or variations.';
-    return text.trim();
+    text += '\nWould you like details on any product or to place an order?';
+    return text;
   } catch (error) {
     console.error('Error handling list inventory:', error);
-    return 'I couldn’t load the catalog right now. Please try again.';
+    return 'Sorry, I couldn\'t load the catalog. Please try again.';
   }
-}
-
-
-function getVariationPrice(product, option) {
-  if (option == null) return product?.price != null ? Number(product.price) : null;
-  if (option.price != null && !isNaN(Number(option.price))) return Number(option.price);
-  if (option.price_adjustment != null && !isNaN(Number(option.price_adjustment))) return Number(option.price_adjustment);
-  if (product?.price != null && !isNaN(Number(product.price))) return Number(product.price);
-  return null;
-}
-
-function normalizeSearchTerm(term) {
-  if (!term || typeof term !== 'string') return null;
-  let value = term.trim().replace(/[?!.]+$/g, '');
-  if (!value) return null;
-
-  value = value
-    .replace(/^(can i see|show me|send me|i want to see|let me see|do you have|i need|i want|looking for|search for|find)\s+/i, '')
-    .replace(/^(?:the\s+)?(?:product\s+)?(?:images?|pictures?|photos?|pics?)\s+(?:of\s+)?/i, '')
-    .replace(/^(?:the\s+)?(?:variations?|options?|sizes?|colors?)\s+(?:for\s+)?/i, '')
-    .replace(/\b(?:you have|you've got|available|in stock|for sale|right now|please)\b/gi, '')
-    .replace(/\b(?:the ones|that one|those ones|ones you have|what you have)\b/gi, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-
-  value = value.replace(/^(the|a|an)\s+/i, '').trim();
-  if (!value || isMediaOnlyWord(value) || isContextReference(value)) return null;
-  return value;
-}
-
-function relaxSearchTerm(term) {
-  if (!term || typeof term !== 'string') return null;
-  const relaxed = term
-    .replace(/\b(?:for men|for women|men|women|male|female)\b/gi, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-  if (!relaxed || relaxed === term) return null;
-  return relaxed;
-}
-
-function getRecentAssistantCatalogItems(conversationHistory) {
-  if (!Array.isArray(conversationHistory) || conversationHistory.length === 0) return [];
-  const recentAssistant = conversationHistory.slice(-6).reverse().find(msg => msg.role === 'assistant' && typeof msg.text === 'string' && /\d+\.\s+.+[–\-]/.test(msg.text));
-  if (!recentAssistant) return [];
-  const names = [];
-  for (const line of recentAssistant.text.split(/\n+/)) {
-    const match = line.match(/^\s*\d+\.\s+([^–\-]+?)\s+[–\-]\s+/);
-    if (match && match[1]) names.push(match[1].trim());
-  }
-  return [...new Set(names)];
-}
-
-function humanizeOutgoingReply(text, conversationHistory = [], customerMessage = '') {
-  let cleaned = String(text || '').trim();
-  if (!cleaned) return cleaned;
-  const hasHistory = Array.isArray(conversationHistory) && conversationHistory.length > 0;
-  const customer = String(customerMessage || '').trim().toLowerCase();
-  const directIntent = /(price|cost|how much|show|send|picture|pictures|image|images|photo|photos|catalog|product|products|variations|options|sizes|colors|recommend|order|buy|available|in stock)/i.test(customer);
-
-  if (hasHistory || directIntent) {
-    cleaned = cleaned
-      .replace(/^(hi|hello|hey)\s+there[!.,\s]*/i, '')
-      .replace(/^(hi|hello|hey)[!.,\s]*/i, '')
-      .replace(/^i'?d love to help[^.?!]*[.?!]\s*/i, '')
-      .replace(/^to give you the best recommendation[^.?!]*[.?!]\s*/i, '')
-      .trim();
-  }
-
-  cleaned = cleaned
-    .replace(/\bkindly note\b/gi, 'please note')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-
-  return cleaned;
 }
 
 function extractSearchTerm(message) {
@@ -638,15 +508,38 @@ function isContextReference(term) {
   return false;
 }
 
+/**
+ * Normalize search term: "sneakers you have" → "sneakers", "pictures you have" → undefined (media word).
+ * Stops the AI from searching for literal "sneakers you have" or "pictures you have" as a product name.
+ */
+function normalizeSearchTerm(search) {
+  if (!search || typeof search !== 'string') return undefined;
+  let t = search.trim();
+  const lower = t.toLowerCase();
+  const stripSuffix = (suffix) => {
+    const re = new RegExp('\\s*' + suffix.replace(/\s+/g, '\\s+') + '\\s*$', 'i');
+    if (re.test(t)) return t.replace(re, '').trim();
+    return null;
+  };
+  const stripped = stripSuffix('you have') || stripSuffix('you got') || stripSuffix('you showed') || stripSuffix('the ones you have');
+  if (stripped !== null) t = stripped;
+  t = t.replace(/^\s*the\s+/i, '').trim();
+  if (!t) return undefined;
+  if (isMediaOnlyWord(t)) return undefined;
+  if (isContextReference(t)) return undefined;
+  return t;
+}
+
 /** Check if message is a generic "show picture" or "show me what you have" (use chat history) */
 function isGenericPictureRequest(message) {
   if (!message || typeof message !== 'string') return false;
   const m = message.trim().toLowerCase();
   if (/^(\s*yes\s*)$/i.test(m)) return true;
-  if (/^(yes\s+)?(let me see|show me|send me|i want to see)\s+(?:the\s+)?(picture|image|photo)s?\.?$/i.test(m)) return true;
+  if (/^(yes\s+)?(let me see|show me|send me|i want to see|can i see)\s+(?:the\s+)?(picture|image|photo)s?\.?$/i.test(m)) return true;
   if (/^(yes\s+)?(picture|image|photo)s?\.?$/i.test(m)) return true;
-  if (/(?:let me see|show me)\s+(?:the\s+)?(?:images?|pictures?|photos?)\s+of\s+(?:the\s+)?ones\s+you\s+have/i.test(m)) return true;
-  if (/(?:let me see|show me)\s+(?:the\s+)?(?:images?|pictures?)\s+of\s+what\s+you\s+have/i.test(m)) return true;
+  if (/(?:let me see|show me|can i see)\s+(?:the\s+)?(?:images?|pictures?|photos?)\s+of\s+(?:the\s+)?ones\s+you\s+have/i.test(m)) return true;
+  if (/(?:let me see|show me|can i see)\s+(?:the\s+)?(?:images?|pictures?)\s+of\s+what\s+you\s+have/i.test(m)) return true;
+  if (/(?:let me see|show me|can i see)\s+(?:the\s+)?(?:pictures?|images?|photos?)\s+(?:you\s+)?have/i.test(m)) return true;
   return false;
 }
 
@@ -672,16 +565,30 @@ function extractLastProductFromConversation(conversationHistory) {
   const fromUser = extractLastMentionedProductFromHistory(conversationHistory);
   if (fromUser) return fromUser;
   if (!Array.isArray(conversationHistory) || conversationHistory.length === 0) return null;
-  const recent = conversationHistory.slice(-6).reverse();
+  const recent = conversationHistory.slice(-8).reverse();
   for (const msg of recent) {
     if (msg.role === 'assistant' && msg.text) {
       const t = msg.text;
-      const assistantList = getRecentAssistantCatalogItems([msg]);
-      if (assistantList.length === 1) return assistantList[0];
-      const m = t.match(/(?:here(?:'s| is)|i just sent|sending you)\s+([^:!.\n]+?)(?:\s*[:\-]|!|\.|\n|$)/i);
+      const lines = t.split(/\n/);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        const hereMatch = trimmed.match(/(?:Here's?|Sending you)\s+([^:!.\n–\-]+?)(?:\s*[:\-]|!|\.|$)/i);
+        if (hereMatch && hereMatch[1]) return hereMatch[1].trim();
+        const listMatch = trimmed.match(/^\d+\.\s+([^–\-]+?)\s+[–\-]\s+(?:from\s+)?₦/);
+        if (listMatch && listMatch[1]) return listMatch[1].trim();
+        const inlineMatch = trimmed.match(/^([A-Za-z0-9\s]+?)\s+[–\-]\s+from\s+₦/);
+        if (inlineMatch && inlineMatch[1]) return inlineMatch[1].trim();
+        const dashOnly = trimmed.match(/^([A-Za-z0-9\s]{2,50}?)\s+[–\-]\s+(?:from\s+)?(?:₦|N)/);
+        if (dashOnly && dashOnly[1]) return dashOnly[1].trim();
+      }
+      const m = t.match(/(?:Here's?|Sending you)\s+([^:!.\n]+?)(?:\s*[:\-]|!|\.|\n|$)/i);
       if (m && m[1]) return m[1].trim();
-      const m2 = t.match(/([A-Za-z0-9\s&()'\/]+?)\s+[–\-]\s+(?:from\s+)?₦/);
+      const m2 = t.match(/\d+\.\s+([^–\-]+?)\s+[–\-]\s+(?:from\s+)?₦/);
       if (m2 && m2[1]) return m2[1].trim();
+      const m3 = t.match(/([A-Za-z0-9\s]+?)\s+[–\-]\s+from\s+₦/);
+      if (m3 && m3[1]) return m3[1].trim();
+      const m4 = t.match(/([A-Za-z0-9\s]{2,50})\s+[–\-]\s+(?:from\s+)?(?:₦|N\d)/);
+      if (m4 && m4[1]) return m4[1].trim();
     }
   }
   return null;
@@ -697,7 +604,6 @@ function extractProductName(message) {
   const patterns = [
     // "image/picture/photo of X" — user wants to see a specific product's image (must come first)
     /(?:can i see|show me|send me|i want to see|let me see|send)\s+(?:the\s+)?(?:product\s+)?(?:image|picture|photo|pic)s?\s+(?:of\s+)(?:the\s+)?(.+?)(?:\?|$|\.)/i,
-    /(?:can i see|show me|send me|i want to see|let me see)\s+(?:the\s+)?(.+?)\s+(?:images?|pictures?|photos?)?(?:\?|$|\.)/i,
     /(?:image|picture|photo|pic)s?\s+(?:of\s+)(?:the\s+)?(.+?)(?:\?|$|\.)/i,
     // "let me see X" / "show me X" — product by name (must check inventory; do not assume by name)
     /(?:let me see|show me)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
