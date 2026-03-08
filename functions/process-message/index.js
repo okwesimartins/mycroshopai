@@ -249,10 +249,11 @@ async function handleInventoryQuery(tenantId, subscriptionPlan, message, intent)
 async function handleListInventory(ctx, shareMedia) {
   const { tenantId, subscriptionPlan, message, accessToken, phoneNumberId, customerPhone } = ctx;
   try {
-    const search = extractProductName(message) || extractSearchTerm(message);
+    let search = extractProductName(message) || extractSearchTerm(message);
+    if (isMediaOnlyWord(search)) search = undefined;
     const listResult = await backendApi.listProducts(tenantId, subscriptionPlan, {
       search: search || undefined,
-      limit: 15
+      limit: search ? 10 : 15
     });
 
     if (!listResult || !listResult.products || listResult.products.length === 0) {
@@ -272,8 +273,8 @@ async function handleListInventory(ctx, shareMedia) {
 
     if (shareMedia && withImages.length > 0 && accessToken && phoneNumberId && customerPhone) {
       const maxImages = 5;
-      for (let i = 0; i < Math.min(withImages.length, maxImages); i++) {
-        const p = withImages[i];
+      const toSend = withImages.slice(0, maxImages);
+      for (const p of toSend) {
         const imageUrl = toFullImageUrl(p.image_url);
         const caption = `${p.name} – ₦${parseFloat(p.price || 0).toLocaleString()}${p.stock != null ? ` (${p.stock} in stock)` : ''}`;
         try {
@@ -284,7 +285,10 @@ async function handleListInventory(ctx, shareMedia) {
       }
     }
 
-    let text = `📦 Here are our products${search ? ` matching "${search}"` : ''}:\n\n`;
+    const singleProduct = products.length === 1 && search;
+    let text = singleProduct
+      ? `📦 Here’s ${products[0].name}:\n\n`
+      : `📦 Here are our products${search ? ` matching "${search}"` : ''}:\n\n`;
     products.forEach((p, i) => {
       text += `${i + 1}. ${p.name} – ₦${parseFloat(p.price || 0).toLocaleString()}`;
       if (p.stock != null) text += ` (${p.stock} in stock)`;
@@ -410,15 +414,25 @@ async function sendWhatsAppResponse(phoneNumberId, to, message, accessToken) {
   await whatsapp.sendMessage(phoneNumberId, accessToken, to, message);
 }
 
+/** Words that mean "photos/pictures" — never use these as product search terms */
+const MEDIA_WORDS = new Set(['image', 'images', 'picture', 'pictures', 'photo', 'photos', 'pic', 'pics']);
+
+function isMediaOnlyWord(term) {
+  if (!term || typeof term !== 'string') return false;
+  return MEDIA_WORDS.has(term.trim().toLowerCase());
+}
+
 /**
- * Extract product name from message (all permutations: availability, price, cost, order, etc.)
+ * Extract product name from message (all permutations: availability, price, cost, order, image of X, etc.)
  */
 function extractProductName(message) {
   if (!message || typeof message !== 'string') return null;
   const m = message.trim();
-  const lowerMessage = m.toLowerCase();
 
   const patterns = [
+    // "image/picture/photo of X" — user wants to see a specific product's image (must come first)
+    /(?:can i see|show me|send me|i want to see|let me see|send)\s+(?:the\s+)?(?:product\s+)?(?:image|picture|photo|pic)s?\s+(?:of\s+)(?:the\s+)?(.+?)(?:\?|$|\.)/i,
+    /(?:image|picture|photo|pic)s?\s+(?:of\s+)(?:the\s+)?(.+?)(?:\?|$|\.)/i,
     // Price / cost
     /(?:how much (?:is|for|does)\s+)(?:the\s+)?(.+?)(?:\s+cost|\s+go\s+for|\?|$|\.)/i,
     /(?:price|cost|amount)\s+(?:of|for)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
@@ -440,7 +454,7 @@ function extractProductName(message) {
     const match = m.match(pattern);
     if (match && match[1]) {
       const name = match[1].trim();
-      if (name.length > 0 && name.length < 120) return name;
+      if (name.length > 0 && name.length < 120 && !isMediaOnlyWord(name)) return name;
     }
   }
 
