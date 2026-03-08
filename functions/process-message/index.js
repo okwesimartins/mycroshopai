@@ -17,6 +17,7 @@ async function processMessage(messageData) {
     tenantId,
     accessToken,
     storeName,
+    businessBio,
     subscriptionPlan: subscriptionPlanFromWebhook,
     defaultOnlineStoreId,
     customerPhone,
@@ -96,6 +97,7 @@ async function processMessage(messageData) {
       subscription_plan: subscriptionPlan,
       customer_phone: customerPhone,
       store_name: storeNameResolved,
+      business_bio: businessBio || null,
       conversation_history: conversationHistory
     };
 
@@ -129,6 +131,14 @@ async function processMessage(messageData) {
         }
       }
     }
+
+    // Remove any raw function names the model may have output so the reply feels human
+    let cleaned = (finalResponse || '')
+      .replace(/\b(list_inventory|query_inventory|create_order|check_payment)\b/gi, '')
+      .replace(/\s*`[^`]*`\s*/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    if (cleaned.length > 0) finalResponse = cleaned;
 
     // Send response via WhatsApp (using token from resolve-tenant)
     try {
@@ -252,15 +262,22 @@ async function handleListInventory(ctx, shareMedia) {
     }
 
     const products = listResult.products;
-    const withImages = products.filter(p => p.image_url && p.image_url.startsWith('http'));
+    const backendBaseUrl = (process.env.BACKEND_BASE_URL || process.env.MYCROSHOP_API_URL || 'https://backend.mycroshop.com').replace(/\/$/, '');
+    const toFullImageUrl = (url) => {
+      if (!url) return null;
+      if (url.startsWith('http')) return url;
+      return `${backendBaseUrl}${url.startsWith('/') ? '' : '/'}${url}`;
+    };
+    const withImages = products.filter(p => toFullImageUrl(p.image_url));
 
     if (shareMedia && withImages.length > 0 && accessToken && phoneNumberId && customerPhone) {
       const maxImages = 5;
       for (let i = 0; i < Math.min(withImages.length, maxImages); i++) {
         const p = withImages[i];
+        const imageUrl = toFullImageUrl(p.image_url);
         const caption = `${p.name} – ₦${parseFloat(p.price || 0).toLocaleString()}${p.stock != null ? ` (${p.stock} in stock)` : ''}`;
         try {
-          await whatsapp.sendImage(phoneNumberId, accessToken, customerPhone, p.image_url, caption);
+          await whatsapp.sendImage(phoneNumberId, accessToken, customerPhone, imageUrl, caption);
         } catch (err) {
           console.error('Error sending product image:', err.message);
         }

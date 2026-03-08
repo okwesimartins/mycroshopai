@@ -128,6 +128,7 @@ functions.http('whatsappWebhook', async (req, res) => {
         tenant_id,
         access_token,
         store_name,
+        business_bio,
         subscription_plan,
         default_online_store_id
       } = tenantContext;
@@ -137,6 +138,7 @@ functions.http('whatsappWebhook', async (req, res) => {
         tenantId: tenant_id,
         accessToken: access_token,
         storeName: store_name,
+        businessBio: business_bio,
         subscriptionPlan: subscription_plan || 'enterprise',
         defaultOnlineStoreId: default_online_store_id,
         customerPhone: messageData.from,
