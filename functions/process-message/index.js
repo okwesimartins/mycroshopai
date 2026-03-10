@@ -127,7 +127,18 @@ async function processMessage(messageData) {
         });
 
         if (actionResult != null) {
-          finalResponse = typeof actionResult === 'string' ? actionResult : actionResult.response || finalResponse;
+          // Keep Gemini's natural reply as the base, and append any backend text instead of overwriting it.
+          if (typeof actionResult === 'string' && actionResult.trim()) {
+            const extra = actionResult.trim();
+            finalResponse = finalResponse && finalResponse.trim()
+              ? `${finalResponse.trim()}\n\n${extra}`
+              : extra;
+          } else if (actionResult && typeof actionResult.response === 'string' && actionResult.response.trim()) {
+            const extra = actionResult.response.trim();
+            finalResponse = finalResponse && finalResponse.trim()
+              ? `${finalResponse.trim()}\n\n${extra}`
+              : extra;
+          }
         }
       }
     }
@@ -191,10 +202,14 @@ async function handleAction(action, ctx) {
   try {
     switch (action.type) {
       case 'query_inventory':
-        return await handleInventoryQuery(tenantId, subscriptionPlan, message, action.intent);
+        return await handleInventoryQuery(tenantId, subscriptionPlan, message, action.intent, action.product_name);
 
       case 'list_inventory':
-        return await handleListInventory(ctx, action.share_media === true);
+        return await handleListInventory({
+          ...ctx,
+          search: action.search || null,
+          share_media: action.share_media === true
+        });
 
       case 'show_variations':
         return await handleShowVariations(ctx);
@@ -217,9 +232,9 @@ async function handleAction(action, ctx) {
 /**
  * Handle inventory query (via backend API) – single product (price, availability, stock)
  */
-async function handleInventoryQuery(tenantId, subscriptionPlan, message, intent) {
+async function handleInventoryQuery(tenantId, subscriptionPlan, message, intent, productFromAction) {
   try {
-    const productName = extractProductName(message);
+    const productName = (productFromAction && String(productFromAction).trim()) || extractProductName(message);
     if (!productName) {
       if (intent === 'price') return null;
       return 'Could you please specify which product you\'re looking for?';
@@ -304,15 +319,29 @@ function formatProductPriceAndStock(p) {
   return { line: `${formatNaira(price)}${stockStr}`, priceNum: price };
 }
 
-async function handleListInventory(ctx, shareMedia) {
-  const { tenantId, subscriptionPlan, message, accessToken, phoneNumberId, customerPhone, conversationHistory = [] } = ctx;
+async function handleListInventory(ctx) {
+  const {
+    tenantId,
+    subscriptionPlan,
+    message,
+    accessToken,
+    phoneNumberId,
+    customerPhone,
+    conversationHistory = [],
+    search: actionSearch = null,
+    share_media = false
+  } = ctx;
   try {
-    let search = extractProductName(message) || extractSearchTerm(message);
-    search = normalizeSearchTerm(search);
-    if (isMediaOnlyWord(search)) search = undefined;
-    if (isContextReference(search)) search = undefined;
-    if (!search && (isGenericPictureRequest(message) || isContextReference(extractProductName(message) || extractSearchTerm(message)))) {
-      search = extractLastProductFromConversation(conversationHistory) || extractLastMentionedProductFromHistory(conversationHistory) || undefined;
+    // Prefer explicit search term from Gemini action; fall back to heuristic extraction only when missing
+    let search = (typeof actionSearch === 'string' && actionSearch.trim()) ? actionSearch.trim() : null;
+    if (!search) {
+      search = extractProductName(message) || extractSearchTerm(message);
+      search = normalizeSearchTerm(search);
+      if (isMediaOnlyWord(search)) search = undefined;
+      if (isContextReference(search)) search = undefined;
+      if (!search && (isGenericPictureRequest(message) || isContextReference(extractProductName(message) || extractSearchTerm(message)))) {
+        search = extractLastProductFromConversation(conversationHistory) || extractLastMentionedProductFromHistory(conversationHistory) || undefined;
+      }
     }
     const listResult = await backendApi.listProducts(tenantId, subscriptionPlan, {
       search: search || undefined,
@@ -334,7 +363,7 @@ async function handleListInventory(ctx, shareMedia) {
     };
     const withImages = products.filter(p => toFullImageUrl(p.image_url));
 
-    if (shareMedia && withImages.length > 0 && accessToken && phoneNumberId && customerPhone) {
+    if (share_media && withImages.length > 0 && accessToken && phoneNumberId && customerPhone) {
       const maxImages = 5;
       const toSend = withImages.slice(0, maxImages);
       for (const p of toSend) {
