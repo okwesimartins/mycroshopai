@@ -4,6 +4,23 @@ const backendApi     = require('../../lib/backend-api');
 const firestore      = require('../../lib/firestore');
 const contactPricing = require('../../lib/contact-pricing');
 
+// Patch backendApi calls to log full error details for debugging
+const origCheckProduct = backendApi.checkProduct.bind(backendApi);
+backendApi.checkProduct = async (tenantId, productName, plan) => {
+  try {
+    const result = await origCheckProduct(tenantId, productName, plan);
+    if (!result) {
+      console.warn(`[BackendAPI:checkProduct] returned null for "${productName}" (tenant=${tenantId})`);
+    }
+    return result;
+  } catch (e) {
+    const status = e.response?.status;
+    const body   = JSON.stringify(e.response?.data || {}).substring(0, 300);
+    console.error(`[BackendAPI:checkProduct] FAILED for "${productName}" | HTTP ${status} | ${body} | ${e.message}`);
+    return null;
+  }
+};
+
 const ai = new GeminiAI(process.env.GEMINI_API_KEY || '');
 
 /**
@@ -158,6 +175,7 @@ async function processMessage(messageData) {
         tenantId, subscriptionPlan, defaultOnlineStoreId,
         message: msgText, conversationHistory, customerPhone,
         accessToken, phoneNumberId, pendingOrder,
+        aiResponse, // pass full response so handlers can see all actions this turn
       });
 
       if (!result) continue;
@@ -262,7 +280,8 @@ async function processMessage(messageData) {
 async function handleAction(action, ctx) {
   const { tenantId, subscriptionPlan, defaultOnlineStoreId,
           message, conversationHistory, customerPhone,
-          accessToken, phoneNumberId, pendingOrder } = ctx;
+          accessToken, phoneNumberId, pendingOrder,
+          aiResponse } = ctx;
   try {
     switch (action.type) {
       case 'list_inventory':
@@ -274,17 +293,28 @@ async function handleAction(action, ctx) {
         });
 
       case 'query_inventory':
-        return await handleQueryInventory(
+        return await handleQueryInventory({
           tenantId, subscriptionPlan,
-          action.product_name || extractProductName(message),
-          action.intent,
-        );
+          productName: action.product_name || extractProductName(message),
+          intent: action.intent,
+          share_media: action.share_media !== false, // default true for single product queries
+          accessToken, phoneNumberId, customerPhone,
+        });
 
-      case 'show_variations':
+      case 'show_variations': {
+        const varProductName = action.product_name || extractLastProduct(conversationHistory);
+        // Skip if query_inventory already ran for this same product this turn
+        // (query_inventory includes variations in its response, so this would duplicate)
+        const queryRanForSameProduct = (aiResponse?.actions || []).some(a =>
+          a.type === 'query_inventory' &&
+          (a.product_name || '').toLowerCase() === (varProductName || '').toLowerCase()
+        );
         return await handleShowVariations(
           tenantId, subscriptionPlan,
-          action.product_name || extractLastProduct(conversationHistory),
+          varProductName,
+          queryRanForSameProduct,
         );
+      }
 
       case 'create_order':
         return await handleOrderCreation({
@@ -351,71 +381,143 @@ async function handleListInventory({ tenantId, subscriptionPlan, search, share_m
 }
 
 // ── Query specific product ────────────────────────────────────────────────────
-async function handleQueryInventory(tenantId, subscriptionPlan, productName, intent) {
-  if (!productName) return { type: 'replace', text: 'Which product did you want to ask about?' };
+async function handleQueryInventory({ tenantId, subscriptionPlan, productName, intent,
+    share_media = true, accessToken, phoneNumberId, customerPhone }) {
 
-  const result = await backendApi.checkProduct(tenantId, productName, subscriptionPlan);
-  if (!result) return { type: 'replace', text: "Couldn't check that right now — try again in a sec." };
+  if (!productName) return { type: 'replace', text: 'Which product were you asking about?' };
 
-  if (result.exists && result.product) {
-    const p          = result.product;
-    const priceStr   = fmtN(p.price);
-    const stockInfo  = p.stock != null ? (p.stock > 0 ? ` ${p.stock} in stock.` : ' Out of stock right now.') : '';
+  const base  = (process.env.BACKEND_BASE_URL || process.env.MYCROSHOP_API_URL || 'https://backend.mycroshop.com').replace(/\/$/, '');
+  const toUrl = url => !url ? null : url.startsWith('http') ? url : `${base}${url.startsWith('/') ? '' : '/'}${url}`;
 
-    // Return as 'soft_replace' — only replaces Gemini's reply if it was a placeholder
-    // If Gemini already wrote a real answer (it had PRODUCT DATA), keep Gemini's reply
-    if (intent === 'price') {
-      return { type: 'soft_replace', text: `${p.name} is ${priceStr}.${stockInfo}` };
+  // Strategy: try checkProduct first, fall back to listProducts search.
+  // Many backends don't implement checkProduct reliably, but listProducts search always works.
+  let product = null;
+
+  try {
+    const checkResult = await backendApi.checkProduct(tenantId, productName, subscriptionPlan);
+    if (checkResult?.exists && checkResult.product) {
+      product = checkResult.product;
+      console.log('[queryInventory] checkProduct found:', product.name);
     }
-    if (intent === 'availability') {
-      return {
-        type: 'soft_replace',
-        text: p.stock > 0
-          ? `Yeah, we have the ${p.name}. ${stockInfo} It's ${priceStr}.`
-          : `${p.name} is out of stock right now. Want me to let you know when it's back?`,
-      };
-    }
-    return { type: 'soft_replace', text: `${p.name}\n${priceStr}${stockInfo}\n\nWant to order?` };
+  } catch (e) {
+    console.warn('[queryInventory] checkProduct threw error:', e.message, '— trying listProducts fallback');
   }
 
-  // Fuzzy fallback — find similar
-  const similar = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 5 });
-  if (similar?.products?.length) {
-    let text = `Couldn't find "${productName}" exactly, but here's what's close:\n\n`;
-    similar.products.forEach((p, i) => { const { line } = priceStock(p); text += `${i+1}. ${p.name} – ${line}\n`; });
-    return { type: 'replace', text };
+  // Fallback: search by name if checkProduct failed or returned nothing
+  if (!product) {
+    try {
+      const searchResult = await backendApi.listProducts(tenantId, subscriptionPlan, {
+        search: productName, limit: 5
+      });
+      if (searchResult?.products?.length) {
+        // Find best match — exact name first, then partial
+        product = searchResult.products.find(p =>
+          p.name?.toLowerCase() === productName.toLowerCase()
+        ) || searchResult.products.find(p =>
+          p.name?.toLowerCase().includes(productName.toLowerCase())
+        ) || searchResult.products[0];
+        console.log('[queryInventory] listProducts fallback found:', product?.name);
+      }
+    } catch (e) {
+      console.error('[queryInventory] listProducts fallback also failed:', e.message);
+    }
   }
 
-  return { type: 'replace', text: `We don't have "${productName}" right now. Want to see the full catalog?` };
+  if (!product) {
+    // Try even broader search before giving up
+    try {
+      const broad = await backendApi.listProducts(tenantId, subscriptionPlan, {
+        search: productName.split(' ')[0], limit: 5 // search just first word
+      });
+      if (broad?.products?.length) {
+        let text = `Couldn't find "${productName}" exactly. Did you mean:\n\n`;
+        broad.products.forEach((p, i) => { const { line } = priceStock(p); text += `${i+1}. ${p.name} – ${line}\n`; });
+        text += '\nWhich one?';
+        return { type: 'replace', text };
+      }
+    } catch (_) {}
+    return { type: 'replace', text: `We don't have "${productName}" right now. Want to see everything we carry?` };
+  }
+
+  // ── We have the product — build the rich response ────────────────────────
+  const priceStr  = fmtN(product.price);
+  const stockNum  = product.stock;
+  const stockInfo = stockNum != null
+    ? (stockNum > 0 ? `${stockNum} in stock` : 'Out of stock')
+    : '';
+
+  // 1. Send product image if available and requested
+  const imageUrl = toUrl(product.image_url || product.imageUrl);
+  if (share_media && imageUrl && accessToken && phoneNumberId && customerPhone) {
+    const caption = `${product.name} — ${priceStr}${stockInfo ? ` | ${stockInfo}` : ''}`;
+    await whatsapp.sendImage(phoneNumberId, accessToken, customerPhone, imageUrl, caption)
+      .catch(e => console.error('[queryInventory] image send failed:', e.message));
+  }
+
+  // 2. Build detail + variations text
+  let text = '';
+
+  if (product.description && product.description.trim()) {
+    text += `${product.description.trim()}\n\n`;
+  }
+
+  text += `💰 Price: ${priceStr}`;
+  if (stockInfo) text += `\n📦 Stock: ${stockInfo}`;
+
+  // 3. Append variations if present
+  if (product.variations?.length) {
+    text += '\n\n';
+    for (const v of product.variations) {
+      const opts = (v.options || []).filter(o => o.is_available !== false);
+      if (!opts.length) continue;
+      if (v.variation_name) text += `${v.variation_name}:\n`;
+      for (const o of opts) {
+        const price = parseFloat(o.price_adjustment || o.price) || parseFloat(product.price) || 0;
+        const oStock = o.stock != null ? ` (${o.stock} left)` : '';
+        text += `• ${o.option_display_name || o.option_value} — ${fmtN(price)}${oStock}\n`;
+      }
+      text += '\n';
+    }
+    text = text.trimEnd() + '\n\nWhich option works for you?';
+  } else {
+    text += '\n\nWant to order?';
+  }
+
+  return { type: 'replace', text };
 }
 
 // ── Show variations ───────────────────────────────────────────────────────────
-async function handleShowVariations(tenantId, subscriptionPlan, productName) {
+async function handleShowVariations(tenantId, subscriptionPlan, productName, skipIfAlreadyInReply = false) {
   if (!productName) return null;
+  // If called alongside query_inventory on same product, query_inventory already includes variations
+  if (skipIfAlreadyInReply) return null;
 
-  const result = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 5 });
+  const result = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 5 })
+    .catch(e => { console.error('[showVariations] listProducts error:', e.message); return null; });
+
   if (!result?.products?.length) return null;
 
   const p = result.products.find(x => x.name?.toLowerCase().includes(productName.toLowerCase()))
          || result.products[0];
 
   if (!p.variations?.length) {
-    return { type: 'replace', text: `${p.name} comes in one option — ${fmtN(p.price || 0)}. Want to order?` };
+    // No variations — product detail already sent by query_inventory, nothing to add
+    return null;
   }
 
-  let text = `${p.name} — available options:\n\n`;
+  let text = `${p.name} options:\n\n`;
   for (const v of p.variations) {
     const opts = (v.options || []).filter(o => o.is_available !== false);
     if (!opts.length) continue;
     if (v.variation_name) text += `${v.variation_name}:\n`;
     for (const o of opts) {
-      const price = parseFloat(o.price_adjustment || o.price) || 0;
+      const price = parseFloat(o.price_adjustment || o.price) || parseFloat(p.price) || 0;
       const stock = o.stock != null ? ` (${o.stock} left)` : '';
-      text += `• ${o.option_display_name || o.option_value} – ${fmtN(price)}${stock}\n`;
+      text += `• ${o.option_display_name || o.option_value} — ${fmtN(price)}${stock}\n`;
     }
     text += '\n';
   }
-  text += 'Which one works for you?';
+  text = text.trimEnd() + '\n\nWhich would you like?';
   return { type: 'replace', text };
 }
 
