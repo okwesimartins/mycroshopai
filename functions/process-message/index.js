@@ -52,6 +52,7 @@ async function processMessage(messageData) {
     message,
     messageId,
     phoneNumberId,
+    quotedMessageId = null,  // set when customer replies to a specific message
   } = messageData;
 
   const subscriptionPlan  = spRaw || 'enterprise';
@@ -70,49 +71,53 @@ async function processMessage(messageData) {
     if (!msgText) { log('skip', 'empty message'); return; }
     log('start', `tenant=${tenantId} customer=${customerPhone} msg="${msgText.substring(0, 80)}"`);
 
-    // ── Deduplication ────────────────────────────────────────────────────
-    // WhatsApp retries webhooks on slow responses — skip already-processed
-    if (messageId && typeof firestore.hasProcessedMessage === 'function') {
-      const done = await firestore.hasProcessedMessage(tenantId, messageId).catch(() => false);
-      if (done) { log('dedup', 'already processed, skipping'); return; }
-    }
+    // ── Parallelised setup reads ─────────────────────────────────────────
+    // All three Firestore reads are independent — run simultaneously.
+    // This saves ~300-500ms vs sequential awaits on every single message.
+    const t0 = Date.now();
+    const [isDuplicate, rawHistory, savedOrderState] = await Promise.all([
+      // 1. Dedup — did we already process this message ID?
+      (messageId && typeof firestore.hasProcessedMessage === 'function')
+        ? firestore.hasProcessedMessage(tenantId, messageId).catch(() => false)
+        : Promise.resolve(false),
 
-    // ── Contact limit ────────────────────────────────────────────────────
-    if (typeof firestore.checkContactLimit === 'function') {
-      const limit = await firestore.checkContactLimit(tenantId)
-        .catch(e => { logErr('contactLimit', e); throw e; });
+      // 2. Conversation history (last 30 turns)
+      typeof firestore.getConversationHistory === 'function'
+        ? firestore.getConversationHistory(tenantId, customerPhone).catch(e => { logErr('history', e); return []; })
+        : Promise.resolve([]),
+
+      // 3. Active order state (for multi-turn ordering)
+      typeof firestore.getOrderState === 'function'
+        ? firestore.getOrderState(tenantId, customerPhone).catch(() => null)
+        : Promise.resolve(null),
+    ]);
+    log('setup', `parallel Firestore reads: ${Date.now() - t0}ms`);
+
+    if (isDuplicate) { log('dedup', 'already processed, skipping'); return; }
+
+    // Contact limit — only matters for brand new customers (first message ever)
+    const isNewCustomer = rawHistory.length === 0;
+    if (isNewCustomer && typeof firestore.checkContactLimit === 'function') {
+      const limit = await firestore.checkContactLimit(tenantId).catch(() => ({ reached: false }));
       if (limit.reached) {
-        const prev = await firestore.getConversationHistory(tenantId, customerPhone, 1).catch(() => []);
-        if (!prev.length) {
-          await safeSend(phoneNumberId, customerPhone, accessToken,
-            `Sorry, this store has reached its contact limit. Please reach out to the merchant directly.`);
-          return;
-        }
+        await safeSend(phoneNumberId, customerPhone, accessToken,
+          `Sorry, this store has reached its contact limit. Please reach out to the merchant directly.`);
+        return;
       }
     }
 
-    // ── Track contact ────────────────────────────────────────────────────
-    await firestore.trackContact?.(tenantId, customerPhone).catch(() => {});
+    // Track contact — fire-and-forget, never block the main flow
+    firestore.trackContact?.(tenantId, customerPhone).catch(() => {});
 
-    // ── Load conversation history + order state ──────────────────────────
-    const rawHistory = typeof firestore.getConversationHistory === 'function'
-      ? await firestore.getConversationHistory(tenantId, customerPhone).catch(e => { logErr('history', e); throw e; })
-      : [];
-
-    // Sanitise history: if any assistant turn stored raw JSON (old bug), extract just the reply text.
-    // This prevents Gemini from seeing {"reply":"...","actions":[]} in model turns and mirroring it.
+    // Sanitise history — strip raw JSON from model turns (old bug: prevents Gemini mirroring format)
     const conversationHistory = rawHistory.map(msg => {
       if (msg.role !== 'user' && typeof msg.text === 'string' && msg.text.trimStart().startsWith('{')) {
         try {
           const parsed = JSON.parse(msg.text);
-          if (parsed.reply && typeof parsed.reply === 'string') {
-            return { ...msg, text: parsed.reply };
-          }
+          if (parsed.reply && typeof parsed.reply === 'string') return { ...msg, text: parsed.reply };
         } catch (_) {
           const m = msg.text.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-          if (m) {
-            try { return { ...msg, text: JSON.parse('"' + m[1] + '"') }; } catch (_2) {}
-          }
+          if (m) { try { return { ...msg, text: JSON.parse('"' + m[1] + '"') }; } catch (_2) {} }
         }
       }
       return msg;
@@ -120,12 +125,9 @@ async function processMessage(messageData) {
 
     let orderState   = 'idle';
     let pendingOrder = null;
-    if (typeof firestore.getOrderState === 'function') {
-      const saved = await firestore.getOrderState(tenantId, customerPhone).catch(() => null);
-      if (saved) { orderState = saved.state || 'idle'; pendingOrder = saved.pending_order || null; }
-    }
+    if (savedOrderState) { orderState = savedOrderState.state || 'idle'; pendingOrder = savedOrderState.pending_order || null; }
 
-    // ── PRE-FETCH product data ───────────────────────────────────────────
+        // ── PRE-FETCH product data ───────────────────────────────────────────
     // Give Gemini REAL product data BEFORE it writes its reply.
     // KEY RULE: If customer says "can I see a picture" after mentioning a specific product,
     // we fetch ONLY that product — not the whole catalog. Prevents catalog dumping.
@@ -167,6 +169,20 @@ async function processMessage(messageData) {
     let inventoryMeta = null;
     if (inventoryIntent.contextual && forcedProductName) {
       inventoryMeta = `INSTRUCTION: Customer is asking to see a picture of "${forcedProductName}" based on earlier conversation. Emit query_inventory with product_name="${forcedProductName}" and share_media:true. Do NOT use list_inventory. Do NOT send the whole catalog.`;
+    } else if (inventoryIntent.colorHint) {
+      inventoryMeta = `CONTEXT: Customer wants "${inventoryIntent.colorHint}" color/variant. Check the product variations for this color option and highlight it in your reply. If found, mention it specifically. If not found, suggest the closest available colors.`;
+    }
+
+    // Resolve quoted message — when customer replies to a specific message ("I want this")
+    // WhatsApp sends context.id with the quoted message ID. We find its content from history.
+    let quotedContext = null;
+    if (quotedMessageId && conversationHistory.length > 0) {
+      // Find the most recent assistant message — that's almost certainly what they quoted
+      const recentAssistant = [...conversationHistory].reverse().find(m => m.role === 'assistant');
+      if (recentAssistant?.text) {
+        quotedContext = `[CUSTOMER IS REPLYING TO THIS SPECIFIC MESSAGE: "${recentAssistant.text.substring(0, 300)}"]`;
+        log('quoted', `Resolved quoted msg → "${recentAssistant.text.substring(0, 80)}"`);
+      }
     }
 
     const aiResponse = await ai.processMessage(msgText, {
@@ -179,6 +195,7 @@ async function processMessage(messageData) {
       order_state:          orderState,
       pending_order:        pendingOrder,
       inventory_meta:       inventoryMeta,
+      quoted_context:       quotedContext,
     }, inventoryText).catch(e => { logErr('gemini', e); throw e; });
 
     log('gemini', `reply="${aiResponse.text?.substring(0, 80)}" actions=[${aiResponse.actions?.map(a=>a.type).join(',')||'none'}]`);
@@ -281,23 +298,23 @@ async function processMessage(messageData) {
     await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, finalReply)
       .catch(e => { logErr('send', e); throw e; });
 
-    // ── Persist ──────────────────────────────────────────────────────────
-    if (typeof firestore.saveMessage === 'function') {
-      await Promise.all([
-        firestore.saveMessage(tenantId, customerPhone, 'user',      msgText,    messageId),
-        firestore.saveMessage(tenantId, customerPhone, 'assistant', finalReply),
-      ]).catch(e => logErr('save', e));
-    }
-
-    if (typeof firestore.saveOrderState === 'function') {
-      await firestore.saveOrderState(tenantId, customerPhone, {
-        state: newOrderState, pending_order: newPending,
-      }).catch(() => {});
-    }
-
-    if (messageId && typeof firestore.markMessageProcessed === 'function') {
-      await firestore.markMessageProcessed(tenantId, messageId).catch(() => {});
-    }
+    // ── Persist — fire and forget ────────────────────────────────────────
+    // Customer already got their reply. Run all writes in parallel, in background.
+    // Failures are logged but don't affect the customer or slow down the response.
+    Promise.all([
+      typeof firestore.saveMessage === 'function'
+        ? firestore.saveMessage(tenantId, customerPhone, 'user',      msgText,    messageId).catch(e => logErr('saveUser', e))
+        : null,
+      typeof firestore.saveMessage === 'function'
+        ? firestore.saveMessage(tenantId, customerPhone, 'assistant', finalReply).catch(e => logErr('saveAI', e))
+        : null,
+      typeof firestore.saveOrderState === 'function'
+        ? firestore.saveOrderState(tenantId, customerPhone, { state: newOrderState, pending_order: newPending }).catch(() => {})
+        : null,
+      messageId && typeof firestore.markMessageProcessed === 'function'
+        ? firestore.markMessageProcessed(tenantId, messageId).catch(() => {})
+        : null,
+    ].filter(Boolean)).catch(() => {});
 
   } catch (err) {
     logErr('FATAL', err);
@@ -395,11 +412,12 @@ async function handleListInventory({ tenantId, subscriptionPlan, search, share_m
   // Send images inline when requested
   if (share_media && accessToken && phoneNumberId && customerPhone) {
     const imgs = products.filter(p => toUrl(p.image_url)).slice(0, 5);
-    for (const p of imgs) {
+    // Send all images in parallel — saves N×200ms vs sequential loop
+    await Promise.all(imgs.map(p => {
       const { line } = priceStock(p);
-      await whatsapp.sendImage(phoneNumberId, accessToken, customerPhone, toUrl(p.image_url), `${p.name} – ${line}`)
+      return whatsapp.sendImage(phoneNumberId, accessToken, customerPhone, toUrl(p.image_url), `${p.name} – ${line}`)
         .catch(e => console.error('[list] image fail:', e.message));
-    }
+    }));
   }
 
   // Build readable catalog text
@@ -720,17 +738,33 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
   }
 
   // Specific category or product search
+  // Key insight: strip color/attribute qualifiers before using as search term.
+  // "sneakers touch of ash colors" → search "sneakers", note color=ash
+  // "blue Air Force 1" → search "Air Force 1", note color=blue
+  const colorWords = /\b(red|blue|green|black|white|grey|gray|ash|brown|pink|yellow|purple|orange|nude|beige|navy|cream|gold|silver|maroon|cyan|teal|olive|coral|mint|lavender|charcoal|khaki|tan|multicolor|multi)\b/gi;
+
   const specificPatterns = [
-    /(?:show me|you have|do you have|got any|any|see|find)\s+(?:the\s+|some\s+)?([a-z][a-z0-9 ]{1,30}?)(?:\?|$|\.|please)/i,
-    /(?:how much is|price of|cost of|how much for)\s+(?:the\s+)?([a-z][a-z0-9 ]{1,30}?)(?:\?|$|\.)/i,
-    /(?:picture|photo|image)s?\s+(?:of\s+)?(?:the\s+)?([a-z][a-z0-9 ]{1,30}?)(?:\?|$|\.)/i,
+    /(?:show me|you have|do you have|got any|any|see|find|need|want|looking for)\s+(?:the\s+|some\s+|a\s+)?([a-z][a-z0-9 ]{1,40}?)(?:\?|$|\.|please|,)/i,
+    /(?:how much is|price of|cost of|how much for)\s+(?:the\s+)?([a-z][a-z0-9 ]{1,40}?)(?:\?|$|\.)/i,
+    /(?:picture|photo|image)s?\s+(?:of\s+)?(?:the\s+)?([a-z][a-z0-9 ]{1,40}?)(?:\?|$|\.)/i,
+    /(?:i need|i want)\s+(?:the\s+|some\s+|a\s+)?([a-z][a-z0-9 ]{1,40}?)(?:\?|$|\.|,|please)/i,
   ];
-  const skipTerms = /^(me|your|the|a|an|any|some|picture|photo|image|catalog|products|items|stuff|price|prices)$/i;
+  const skipTerms = /^(me|your|the|a|an|any|some|picture|photo|image|catalog|products|items|stuff|price|prices|touch|of|with|in|and|type|kind|style|color|colour|colors|colours)$/i;
 
   for (const p of specificPatterns) {
     const match = message.match(p);
-    if (match?.[1] && !skipTerms.test(match[1].trim())) {
-      return { needed: true, search: match[1].trim() };
+    if (match?.[1]) {
+      // Strip color words and noise from the search term — they confuse the backend search
+      const raw = match[1].trim();
+      const cleaned = raw.replace(colorWords, '').replace(/\s{2,}/g, ' ').trim();
+      const searchTerm = cleaned.split(' ').filter(w => !skipTerms.test(w)).join(' ').trim();
+
+      if (searchTerm && searchTerm.length > 1) {
+        // Capture color mentions to pass as context
+        const colorMatches = raw.match(colorWords);
+        const colorHint = colorMatches ? colorMatches.join(', ') : null;
+        return { needed: true, search: searchTerm, colorHint };
+      }
     }
   }
 

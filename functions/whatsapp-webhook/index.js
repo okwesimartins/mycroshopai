@@ -3,6 +3,17 @@ const whatsapp = require('../../lib/whatsapp');
 const backendApi = require('../../lib/backend-api');
 const { processMessage } = require('../process-message');
 
+// ── Message debounce buffer ───────────────────────────────────────────────────
+// When a customer sends two messages rapidly (e.g. "Hi" then "I want shoes size 42"),
+// WhatsApp delivers them as separate webhooks milliseconds apart.
+// Without debouncing, we respond to each separately — double reply, split context.
+// With debouncing: wait 1.5s, collect all messages from same customer, process as one.
+//
+// Key: `${tenantId}:${customerPhone}`
+// Value: { timer, messages: [{text, messageId, quotedMessageId}], context }
+const pendingMessages = new Map();
+const DEBOUNCE_MS = 1500; // 1.5 seconds — enough for rapid successive messages
+
 /**
  * WhatsApp Webhook Handler
  * Receives webhooks from Meta WhatsApp Business API.
@@ -133,8 +144,11 @@ functions.http('whatsappWebhook', async (req, res) => {
         default_online_store_id
       } = tenantContext;
 
-      // Process message asynchronously (API + Firestore only; no DB)
-      processMessage({
+      // ── Debounced dispatch ────────────────────────────────────────────────
+      // Buffer rapid messages from the same customer and process them together.
+      // This prevents double-replies when customer sends "Hi" + "I want shoes" in quick succession.
+      const bufferKey = `${tenant_id}:${messageData.from}`;
+      const tenantCtx = {
         tenantId: tenant_id,
         accessToken: access_token,
         storeName: store_name,
@@ -142,15 +156,38 @@ functions.http('whatsappWebhook', async (req, res) => {
         subscriptionPlan: subscription_plan || 'enterprise',
         defaultOnlineStoreId: default_online_store_id,
         customerPhone: messageData.from,
-        message: messageData.text,
-        messageId: messageData.messageId,
-        phoneNumberId: messageData.phoneNumberId
-      }).catch(error => {
-        console.error('[webhook] processMessage failed:', error?.message || error);
-        if (error?.stack) console.error('[webhook] processMessage stack:', error.stack);
-      });
+        phoneNumberId: messageData.phoneNumberId,
+      };
 
-      // Return 200 immediately to acknowledge receipt
+      if (pendingMessages.has(bufferKey)) {
+        // Another message from this customer is already buffered — merge it
+        const pending = pendingMessages.get(bufferKey);
+        clearTimeout(pending.timer);
+        pending.messages.push({
+          text: messageData.text,
+          messageId: messageData.messageId,
+          quotedMessageId: messageData.quotedMessageId || null,
+        });
+        console.log(`[webhook] Buffered message for ${messageData.from} (${pending.messages.length} total)`);
+
+        // Reset the debounce timer
+        pending.timer = setTimeout(() => flushMessages(bufferKey), DEBOUNCE_MS);
+      } else {
+        // First message in this window — start the buffer
+        const entry = {
+          messages: [{
+            text: messageData.text,
+            messageId: messageData.messageId,
+            quotedMessageId: messageData.quotedMessageId || null,
+          }],
+          ctx: tenantCtx,
+          timer: null,
+        };
+        entry.timer = setTimeout(() => flushMessages(bufferKey), DEBOUNCE_MS);
+        pendingMessages.set(bufferKey, entry);
+      }
+
+      // Return 200 immediately — Meta requires fast acknowledgement
       return res.status(200).json({ status: 'ok' });
     }
 
@@ -160,5 +197,37 @@ functions.http('whatsappWebhook', async (req, res) => {
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// ── Flush buffered messages ───────────────────────────────────────────────────
+// Called after the debounce window closes. Merges all buffered messages from
+// one customer into a single combined message and processes it once.
+function flushMessages(bufferKey) {
+  const pending = pendingMessages.get(bufferKey);
+  pendingMessages.delete(bufferKey);
+  if (!pending) return;
+
+  const { messages, ctx } = pending;
+
+  // Combine all texts into one message, preserving order
+  const combinedText = messages.map(m => m.text).filter(Boolean).join('\n');
+  // Use the last messageId for dedup tracking
+  const lastMessage  = messages[messages.length - 1];
+  // Use the first quoted message context found (if any)
+  const quotedMessageId = messages.find(m => m.quotedMessageId)?.quotedMessageId || null;
+
+  if (!combinedText.trim()) return;
+
+  console.log(`[webhook] Flushing ${messages.length} message(s) for ${ctx.customerPhone}: "${combinedText.substring(0, 100)}"`);
+
+  processMessage({
+    ...ctx,
+    message: combinedText,
+    messageId: lastMessage.messageId,
+    quotedMessageId,
+  }).catch(error => {
+    console.error('[webhook] processMessage failed:', error?.message || error);
+    if (error?.stack) console.error('[webhook] processMessage stack:', error.stack);
+  });
+}
 
 
