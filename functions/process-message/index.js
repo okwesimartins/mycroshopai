@@ -126,22 +126,33 @@ async function processMessage(messageData) {
     }
 
     // ── PRE-FETCH product data ───────────────────────────────────────────
-    // This is what makes Gemini sound natural:
-    // We give it REAL product names and prices BEFORE it writes its reply.
-    // Instead of "Checking now..." it can say "Jordan 1 is ₦38k, we have 4 left. What size?"
+    // Give Gemini REAL product data BEFORE it writes its reply.
+    // KEY RULE: If customer says "can I see a picture" after mentioning a specific product,
+    // we fetch ONLY that product — not the whole catalog. Prevents catalog dumping.
     let inventoryText = null;
+    let forcedProductName = null; // set when we know exactly what product to show
     const inventoryIntent = detectInventoryIntent(msgText, conversationHistory, orderState);
 
     if (inventoryIntent.needed) {
       try {
-        const result = await backendApi.listProducts(tenantId, subscriptionPlan, {
-          search: inventoryIntent.search || undefined,
-          limit:  inventoryIntent.search ? 12 : 20,
-        });
+        // If this is a contextual picture request (customer already said what they want),
+        // fetch ONLY that specific product so Gemini doesn't have 16 products to pick from
+        const searchTerm = inventoryIntent.search || undefined;
+        const limit = searchTerm ? 5 : 20;
+
+        const result = await backendApi.listProducts(tenantId, subscriptionPlan, { search: searchTerm, limit });
 
         if (result?.products?.length) {
-          inventoryText = formatProductsForPrompt(result.products);
-          log('preload', `${result.products.length} products injected (search: ${inventoryIntent.search || 'all'})`);
+          // For contextual requests (picture of X), inject only the matched product
+          const products = inventoryIntent.contextual && result.products.length > 1
+            ? result.products.slice(0, 1)  // just the top match
+            : result.products;
+
+          inventoryText = formatProductsForPrompt(products);
+          if (inventoryIntent.contextual) {
+            forcedProductName = products[0]?.name || searchTerm;
+          }
+          log('preload', `${products.length} products injected (search: ${searchTerm || 'all'}, contextual: ${!!inventoryIntent.contextual})`);
         } else {
           inventoryText = '[No products found in catalog right now]';
           log('preload', 'no products found');
@@ -152,6 +163,12 @@ async function processMessage(messageData) {
     }
 
     // ── Call Gemini ──────────────────────────────────────────────────────
+    // For contextual picture requests, tell Gemini exactly what to do
+    let inventoryMeta = null;
+    if (inventoryIntent.contextual && forcedProductName) {
+      inventoryMeta = `INSTRUCTION: Customer is asking to see a picture of "${forcedProductName}" based on earlier conversation. Emit query_inventory with product_name="${forcedProductName}" and share_media:true. Do NOT use list_inventory. Do NOT send the whole catalog.`;
+    }
+
     const aiResponse = await ai.processMessage(msgText, {
       tenant_id:            tenantId,
       subscription_plan:    subscriptionPlan,
@@ -161,6 +178,7 @@ async function processMessage(messageData) {
       conversation_history: conversationHistory,
       order_state:          orderState,
       pending_order:        pendingOrder,
+      inventory_meta:       inventoryMeta,
     }, inventoryText).catch(e => { logErr('gemini', e); throw e; });
 
     log('gemini', `reply="${aiResponse.text?.substring(0, 80)}" actions=[${aiResponse.actions?.map(a=>a.type).join(',')||'none'}]`);
@@ -170,7 +188,20 @@ async function processMessage(messageData) {
     let newOrderState = aiResponse.order_state || orderState;
     let newPending    = pendingOrder;
 
-    for (const action of (aiResponse.actions || [])) {
+    // Safety net: if Gemini emits list_inventory with share_media for a contextual picture request,
+    // convert it to query_inventory for the specific product so we don't dump the whole catalog
+    let actionsToRun = aiResponse.actions || [];
+    if (inventoryIntent.contextual && forcedProductName) {
+      actionsToRun = actionsToRun.map(a => {
+        if (a.type === 'list_inventory' && a.share_media) {
+          log('ctx-override', `Converting list_inventory→query_inventory for contextual picture: ${forcedProductName}`);
+          return { ...a, type: 'query_inventory', intent: 'availability', product_name: forcedProductName, share_media: true };
+        }
+        return a;
+      });
+    }
+
+    for (const action of actionsToRun) {
       const result = await handleAction(action, {
         tenantId, subscriptionPlan, defaultOnlineStoreId,
         message: msgText, conversationHistory, customerPhone,
@@ -674,10 +705,13 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
     return { needed: true, search: null };
   }
 
-  // Picture requests (use context for search term)
+  // Picture requests — use conversation context to find what they mean
   if (/\b(picture|photo|image|pic)\b/.test(m)) {
     const lastProduct = extractLastProduct(conversationHistory);
-    return { needed: true, search: lastProduct };
+    // If we know what product they're asking about from context,
+    // return it as a targeted search so we only fetch that product
+    // (not the whole catalog). Gemini will emit query_inventory, not list_inventory.
+    return { needed: true, search: lastProduct, contextual: !!lastProduct };
   }
 
   return { needed: false, search: null };
@@ -766,22 +800,42 @@ function extractProductName(message) {
 /** Get last product mentioned in conversation (for context-based requests) */
 function extractLastProduct(history) {
   if (!Array.isArray(history)) return null;
-  for (const msg of [...history].reverse().slice(0, 12)) {
-    if (!msg.text) continue;
-    // Numbered list item: "1. Air Max – ₦25,000"
-    const list = msg.text.match(/\d+\.\s+([^–\-\n]{2,50}?)\s+[–\-]/);
-    if (list?.[1]) return list[1].trim();
-    // "Here you go" / "Here's the X" patterns
-    if (msg.role === 'assistant') {
-      const here = msg.text.match(/(?:here(?:'s| are the| you go)|sending the)\s+([^:\n.!]{2,50})/i);
-      if (here?.[1]) return here[1].trim();
+  const recent = [...history].reverse().slice(0, 16);
+
+  // PRIORITY 1: What did the USER explicitly ask about or mention wanting?
+  // This is the most reliable signal — the customer's own words.
+  for (const msg of recent) {
+    if (msg.role !== 'user' || !msg.text) continue;
+    const t = msg.text.toLowerCase();
+
+    // "I'm looking for sneakers", "I want sneakers", "looking for X"
+    const lookingFor = msg.text.match(/(?:looking for|want|need|interested in|after)\s+(?:a\s+|some\s+|the\s+)?([A-Za-z][A-Za-z0-9 ]{2,35}?)(?:\s+please|\?|$|\.)/i);
+    if (lookingFor?.[1]) {
+      const term = lookingFor[1].trim();
+      // Skip generic words
+      if (!/^(a|an|the|some|any|something|stuff|products?|items?|things?)$/i.test(term)) {
+        return term;
+      }
     }
-    // User asked about a product
-    if (msg.role === 'user') {
-      const name = extractProductName(msg.text);
-      if (name) return name;
-    }
+
+    // Direct product name in a buy/order/price context
+    const name = extractProductName(msg.text);
+    if (name) return name;
   }
+
+  // PRIORITY 2: What was the LAST specific product the assistant mentioned?
+  // Only single-product mentions, not catalog lists.
+  for (const msg of recent) {
+    if (msg.role !== 'assistant' || !msg.text) continue;
+    // Skip messages that look like catalog lists (have multiple numbered items)
+    const numberedItems = (msg.text.match(/^\d+\./gm) || []).length;
+    if (numberedItems > 1) continue; // this is a catalog, not a single product reference
+
+    // Single numbered item (e.g. from a focused search result)
+    const single = msg.text.match(/^1\.\s+([^–\-\n]{2,40}?)\s+[–\-]/m);
+    if (single?.[1]) return single[1].trim();
+  }
+
   return null;
 }
 
