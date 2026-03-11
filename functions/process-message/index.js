@@ -78,9 +78,28 @@ async function processMessage(messageData) {
     await firestore.trackContact?.(tenantId, customerPhone).catch(() => {});
 
     // ── Load conversation history + order state ──────────────────────────
-    const conversationHistory = typeof firestore.getConversationHistory === 'function'
+    const rawHistory = typeof firestore.getConversationHistory === 'function'
       ? await firestore.getConversationHistory(tenantId, customerPhone).catch(e => { logErr('history', e); throw e; })
       : [];
+
+    // Sanitise history: if any assistant turn stored raw JSON (old bug), extract just the reply text.
+    // This prevents Gemini from seeing {"reply":"...","actions":[]} in model turns and mirroring it.
+    const conversationHistory = rawHistory.map(msg => {
+      if (msg.role !== 'user' && typeof msg.text === 'string' && msg.text.trimStart().startsWith('{')) {
+        try {
+          const parsed = JSON.parse(msg.text);
+          if (parsed.reply && typeof parsed.reply === 'string') {
+            return { ...msg, text: parsed.reply };
+          }
+        } catch (_) {
+          const m = msg.text.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+          if (m) {
+            try { return { ...msg, text: JSON.parse('"' + m[1] + '"') }; } catch (_2) {}
+          }
+        }
+      }
+      return msg;
+    });
 
     let orderState   = 'idle';
     let pendingOrder = null;
@@ -182,6 +201,30 @@ async function processMessage(messageData) {
       .trim();
 
     if (!finalReply) finalReply = 'Something went wrong on my end. Try again in a moment.';
+
+    // ── Final JSON leak guard ────────────────────────────────────────────
+    // Last-resort safety: if finalReply is still a JSON object string, extract the reply field.
+    // This should never happen if the above parsing worked, but belt-and-suspenders.
+    if (finalReply.trimStart().startsWith('{')) {
+      try {
+        const parsed = JSON.parse(finalReply);
+        if (parsed.reply && typeof parsed.reply === 'string') {
+          log('json-guard', 'Caught JSON leaking to customer — extracting reply field');
+          finalReply = parsed.reply.trim();
+        }
+      } catch (_) {
+        // Try regex
+        const m = finalReply.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        if (m) {
+          try { finalReply = JSON.parse('"' + m[1] + '"'); } catch (_2) { finalReply = m[1]; }
+          log('json-guard', 'Regex-extracted reply from JSON string');
+        } else {
+          // Completely unparseable JSON — use safe fallback
+          finalReply = "Hey, what can I help you with?";
+          log('json-guard', 'Could not parse JSON, using safe fallback');
+        }
+      }
+    }
 
     // ── Send to customer ─────────────────────────────────────────────────
     await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, finalReply)
