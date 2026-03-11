@@ -1,16 +1,27 @@
-const gemini = require('../../lib/gemini');
-const whatsapp = require('../../lib/whatsapp');
-const backendApi = require('../../lib/backend-api');
-const firestore = require('../../lib/firestore');
+const GeminiAI       = require('../../lib/gemini');
+const whatsapp       = require('../../lib/whatsapp');
+const backendApi     = require('../../lib/backend-api');
+const firestore      = require('../../lib/firestore');
 const contactPricing = require('../../lib/contact-pricing');
-const payments = require('../../lib/payments'); // for formatPaymentConfirmation only
 
-// Initialize Gemini AI (key checked at first use to avoid startup failure)
-const ai = new gemini(process.env.GEMINI_API_KEY || '');
+const ai = new GeminiAI(process.env.GEMINI_API_KEY || '');
 
 /**
- * Process incoming WhatsApp message
- * @param {Object} messageData - Message data
+ * processMessage — the conversation engine
+ *
+ * Flow:
+ * 1. Dedup + contact limit check
+ * 2. Load conversation history + order state from Firestore
+ * 3. Detect intent → pre-fetch product data from backend
+ * 4. Call Gemini WITH the product data already injected
+ *    → Gemini writes a COMPLETE natural reply using real data
+ *    → Gemini also returns actions to execute
+ * 5. Execute actions (send images, confirm order, verify payment)
+ * 6. Gemini's reply is the message — action results refine/replace only when needed
+ * 7. Send to WhatsApp, save history
+ *
+ * The key insight: Gemini must see real data BEFORE writing the reply.
+ * That's what makes it sound natural instead of "Checking now... [separate data dump]"
  */
 async function processMessage(messageData) {
   const {
@@ -18,679 +29,636 @@ async function processMessage(messageData) {
     accessToken,
     storeName,
     businessBio,
-    subscriptionPlan: subscriptionPlanFromWebhook,
+    subscriptionPlan: spRaw,
     defaultOnlineStoreId,
     customerPhone,
     message,
     messageId,
-    phoneNumberId
+    phoneNumberId,
   } = messageData;
 
-  const subscriptionPlan = subscriptionPlanFromWebhook || 'enterprise';
+  const subscriptionPlan  = spRaw || 'enterprise';
   const storeNameResolved = storeName || 'our store';
 
-  const logError = (step, err) => {
-    console.error(`[processMessage] ERROR at ${step}:`, err?.message || err);
-    if (err?.stack) {
-      console.error(`[processMessage] ${step} stack:`, err.stack);
-    }
-    if (err?.response?.data) {
-      console.error(`[processMessage] ${step} response:`, JSON.stringify(err.response.data).substring(0, 500));
-    }
+  const log    = (tag, ...a) => console.log(`[pm:${tag}]`, ...a);
+  const logErr = (tag, err) => {
+    console.error(`[pm:ERR:${tag}]`, err?.message || err);
+    if (err?.stack) console.error(err.stack.split('\n').slice(0, 4).join('\n'));
   };
 
   try {
-    if (!process.env.GEMINI_API_KEY) {
-      console.error('[processMessage] GEMINI_API_KEY is not set');
-      throw new Error('GEMINI_API_KEY is not set');
-    }
-    const msgPreview = (message || '').trim();
-    if (!msgPreview) {
-      console.log('[processMessage] Empty message, skipping');
-      return;
-    }
-    console.log(`[processMessage] Processing for tenant ${tenantId}, customer ${customerPhone}:`, msgPreview.substring(0, 80));
+    // ── Guard ────────────────────────────────────────────────────────────
+    if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not set');
+    const msgText = (message || '').trim();
+    if (!msgText) { log('skip', 'empty message'); return; }
+    log('start', `tenant=${tenantId} customer=${customerPhone} msg="${msgText.substring(0, 80)}"`);
 
-    // Check contact limit before processing (Firestore) – skip if Firestore not configured
+    // ── Deduplication ────────────────────────────────────────────────────
+    // WhatsApp retries webhooks on slow responses — skip already-processed
+    if (messageId && typeof firestore.hasProcessedMessage === 'function') {
+      const done = await firestore.hasProcessedMessage(tenantId, messageId).catch(() => false);
+      if (done) { log('dedup', 'already processed, skipping'); return; }
+    }
+
+    // ── Contact limit ────────────────────────────────────────────────────
     if (typeof firestore.checkContactLimit === 'function') {
-      let contactLimit;
-      try {
-        contactLimit = await firestore.checkContactLimit(tenantId);
-      } catch (err) {
-        logError('contact_limit', err);
-        throw err;
-      }
-
-      if (contactLimit.reached) {
-        const isNewContact = typeof firestore.getConversationHistory === 'function'
-          ? !(await firestore.getConversationHistory(tenantId, customerPhone, 1)).length > 0
-          : true;
-        if (isNewContact) {
-          const upgradeMessage = contactPricing.getUpgradeMessage(contactLimit.count, contactLimit.limit);
-          await sendWhatsAppResponse(
-            phoneNumberId,
-            customerPhone,
-            `Sorry, you've reached your contact limit (${contactLimit.count}/${contactLimit.limit}). ` +
-            `Please upgrade your plan to continue receiving messages from new customers. ` +
-            `Contact support for assistance.`,
-            accessToken
-          );
+      const limit = await firestore.checkContactLimit(tenantId)
+        .catch(e => { logErr('contactLimit', e); throw e; });
+      if (limit.reached) {
+        const prev = await firestore.getConversationHistory(tenantId, customerPhone, 1).catch(() => []);
+        if (!prev.length) {
+          await safeSend(phoneNumberId, customerPhone, accessToken,
+            `Sorry, this store has reached its contact limit. Please reach out to the merchant directly.`);
           return;
         }
       }
     }
 
-    // Get conversation history from Firestore (empty if Firestore not configured)
-    let conversationHistory = [];
-    if (typeof firestore.getConversationHistory === 'function') {
+    // ── Track contact ────────────────────────────────────────────────────
+    await firestore.trackContact?.(tenantId, customerPhone).catch(() => {});
+
+    // ── Load conversation history + order state ──────────────────────────
+    const conversationHistory = typeof firestore.getConversationHistory === 'function'
+      ? await firestore.getConversationHistory(tenantId, customerPhone).catch(e => { logErr('history', e); throw e; })
+      : [];
+
+    let orderState   = 'idle';
+    let pendingOrder = null;
+    if (typeof firestore.getOrderState === 'function') {
+      const saved = await firestore.getOrderState(tenantId, customerPhone).catch(() => null);
+      if (saved) { orderState = saved.state || 'idle'; pendingOrder = saved.pending_order || null; }
+    }
+
+    // ── PRE-FETCH product data ───────────────────────────────────────────
+    // This is what makes Gemini sound natural:
+    // We give it REAL product names and prices BEFORE it writes its reply.
+    // Instead of "Checking now..." it can say "Jordan 1 is ₦38k, we have 4 left. What size?"
+    let inventoryText = null;
+    const inventoryIntent = detectInventoryIntent(msgText, conversationHistory, orderState);
+
+    if (inventoryIntent.needed) {
       try {
-        conversationHistory = await firestore.getConversationHistory(tenantId, customerPhone);
-      } catch (err) {
-        logError('conversation_history', err);
-        throw err;
+        const result = await backendApi.listProducts(tenantId, subscriptionPlan, {
+          search: inventoryIntent.search || undefined,
+          limit:  inventoryIntent.search ? 12 : 20,
+        });
+
+        if (result?.products?.length) {
+          inventoryText = formatProductsForPrompt(result.products);
+          log('preload', `${result.products.length} products injected (search: ${inventoryIntent.search || 'all'})`);
+        } else {
+          inventoryText = '[No products found in catalog right now]';
+          log('preload', 'no products found');
+        }
+      } catch (e) {
+        logErr('preload', e); // non-fatal — Gemini still responds
       }
     }
 
-    // Process message with Gemini AI
-    const context = {
-      tenant_id: tenantId,
-      subscription_plan: subscriptionPlan,
-      customer_phone: customerPhone,
-      store_name: storeNameResolved,
-      business_bio: businessBio || null,
-      conversation_history: conversationHistory
-    };
+    // ── Call Gemini ──────────────────────────────────────────────────────
+    const aiResponse = await ai.processMessage(msgText, {
+      tenant_id:            tenantId,
+      subscription_plan:    subscriptionPlan,
+      customer_phone:       customerPhone,
+      store_name:           storeNameResolved,
+      business_bio:         businessBio || null,
+      conversation_history: conversationHistory,
+      order_state:          orderState,
+      pending_order:        pendingOrder,
+    }, inventoryText).catch(e => { logErr('gemini', e); throw e; });
 
-    let aiResponse;
-    try {
-      aiResponse = await ai.processMessage(message, context);
-    } catch (err) {
-      logError('ai_processMessage', err);
-      throw err;
-    }
+    log('gemini', `reply="${aiResponse.text?.substring(0, 80)}" actions=[${aiResponse.actions?.map(a=>a.type).join(',')||'none'}]`);
 
-    // Handle AI actions (via backend API) – intent drives which API we call
-    let finalResponse = aiResponse.text;
+    // ── Execute actions ──────────────────────────────────────────────────
+    let finalReply    = aiResponse.text || '';
+    let newOrderState = aiResponse.order_state || orderState;
+    let newPending    = pendingOrder;
 
-    if (aiResponse.actions && aiResponse.actions.length > 0) {
-      console.log('[processMessage] Intent -> API actions:', aiResponse.actions.map(a => a.type).join(', '));
-      for (const action of aiResponse.actions) {
-        const actionResult = await handleAction(action, {
-          tenantId,
-          subscriptionPlan,
-          defaultOnlineStoreId,
-          message,
-          conversationHistory,
-          accessToken,
-          phoneNumberId,
-          customerPhone
-        });
+    for (const action of (aiResponse.actions || [])) {
+      const result = await handleAction(action, {
+        tenantId, subscriptionPlan, defaultOnlineStoreId,
+        message: msgText, conversationHistory, customerPhone,
+        accessToken, phoneNumberId, pendingOrder,
+      });
 
-        if (actionResult != null) {
-          // Keep Gemini's natural reply as the base, and append any backend text instead of overwriting it.
-          if (typeof actionResult === 'string' && actionResult.trim()) {
-            const extra = actionResult.trim();
-            finalResponse = finalResponse && finalResponse.trim()
-              ? `${finalResponse.trim()}\n\n${extra}`
-              : extra;
-          } else if (actionResult && typeof actionResult.response === 'string' && actionResult.response.trim()) {
-            const extra = actionResult.response.trim();
-            finalResponse = finalResponse && finalResponse.trim()
-              ? `${finalResponse.trim()}\n\n${extra}`
-              : extra;
-          }
+      if (!result) continue;
+
+      if (result.type === 'order_pending') {
+        // Partial order — save collected data, Gemini's collecting-details reply stays
+        newPending    = result.pending_order;
+        newOrderState = 'collecting_details';
+
+      } else if (result.type === 'replace') {
+        // Hard replace — order confirmation, payment result, error messages
+        finalReply = result.text || finalReply;
+
+      } else if (result.type === 'soft_replace') {
+        // Soft replace — only overwrite if Gemini wrote a placeholder, not a real answer
+        // (Gemini may have already answered perfectly from pre-injected PRODUCT DATA)
+        if (isPlaceholder(finalReply) || !finalReply.includes('₦')) {
+          finalReply = result.text || finalReply;
+        }
+
+      } else if (result.type === 'append_images') {
+        // Images sent inline; append formatted catalog text after Gemini's intro
+        if (result.text) finalReply = mergeIntroAndData(finalReply, result.text);
+
+      } else if (result.type === 'data') {
+        // Backend returned richer data than what was pre-loaded — replace Gemini's text
+        // ONLY if Gemini's reply looks like a placeholder (it said "checking" or similar)
+        if (result.text && isPlaceholder(finalReply)) {
+          finalReply = result.text;
+        } else if (result.text) {
+          finalReply = mergeIntroAndData(finalReply, result.text);
         }
       }
     }
 
-    // Remove any raw function names the model may have output so the reply feels human
-    let cleaned = (finalResponse || '')
-      .replace(/\b(list_inventory|query_inventory|create_order|check_payment)\b/gi, '')
-      .replace(/\s*`[^`]*`\s*/g, ' ')
+    // ── Final cleanup ────────────────────────────────────────────────────
+    finalReply = (finalReply || '')
+      .replace(/\b(list_inventory|query_inventory|create_order|check_payment|show_variations)\b/gi, '')
       .replace(/\n{3,}/g, '\n\n')
+      .replace(/ {2,}/g, ' ')
       .trim();
-    if (cleaned.length > 0) finalResponse = cleaned;
 
-    // Send response via WhatsApp (using token from resolve-tenant)
-    try {
-      await sendWhatsAppResponse(phoneNumberId, customerPhone, finalResponse, accessToken);
-    } catch (err) {
-      logError('send_whatsapp_response', err);
-      throw err;
-    }
+    if (!finalReply) finalReply = 'Something went wrong on my end. Try again in a moment.';
 
-    // Save conversation history to Firestore (no-op if Firestore not configured)
+    // ── Send to customer ─────────────────────────────────────────────────
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, finalReply)
+      .catch(e => { logErr('send', e); throw e; });
+
+    // ── Persist ──────────────────────────────────────────────────────────
     if (typeof firestore.saveMessage === 'function') {
-      try {
-        await firestore.saveMessage(tenantId, customerPhone, 'user', message, messageId);
-        await firestore.saveMessage(tenantId, customerPhone, 'assistant', finalResponse);
-      } catch (err) {
-        logError('save_history', err);
-        // Don't throw - message was already sent; log and continue
-      }
+      await Promise.all([
+        firestore.saveMessage(tenantId, customerPhone, 'user',      msgText,    messageId),
+        firestore.saveMessage(tenantId, customerPhone, 'assistant', finalReply),
+      ]).catch(e => logErr('save', e));
     }
 
-    // Check if follow-up should be scheduled (like a human sales agent would)
-    await checkAndScheduleFollowUp(tenantId, customerPhone, message, finalResponse, conversationHistory);
+    if (typeof firestore.saveOrderState === 'function') {
+      await firestore.saveOrderState(tenantId, customerPhone, {
+        state: newOrderState, pending_order: newPending,
+      }).catch(() => {});
+    }
 
-  } catch (error) {
-    console.error('[processMessage] FAILED:', error?.message || error);
-    console.error('[processMessage] Full error:', error);
-    if (error?.stack) {
-      console.error('[processMessage] Stack:', error.stack);
+    if (messageId && typeof firestore.markMessageProcessed === 'function') {
+      await firestore.markMessageProcessed(tenantId, messageId).catch(() => {});
     }
-    
-    // Send error message to customer
-    try {
-      await sendWhatsAppResponse(
-        phoneNumberId,
-        customerPhone,
-        'Sorry, I encountered an error. Please try again or contact support.',
-        accessToken
-      );
-    } catch (sendError) {
-      console.error('[processMessage] Error sending fallback message to user:', sendError?.message || sendError);
-    }
+
+  } catch (err) {
+    logErr('FATAL', err);
+    await safeSend(phoneNumberId, customerPhone, accessToken,
+      'Sorry, something went wrong. Try again in a moment.').catch(() => {});
   }
 }
 
-/**
- * Handle AI actions (via backend API: inventory, list catalog, order, payment)
- */
+// ─────────────────────────────────────────────────────────────────────────────
+//  Action Handlers
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function handleAction(action, ctx) {
-  const { tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory } = ctx;
+  const { tenantId, subscriptionPlan, defaultOnlineStoreId,
+          message, conversationHistory, customerPhone,
+          accessToken, phoneNumberId, pendingOrder } = ctx;
   try {
     switch (action.type) {
-      case 'query_inventory':
-        return await handleInventoryQuery(tenantId, subscriptionPlan, message, action.intent, action.product_name);
-
       case 'list_inventory':
         return await handleListInventory({
-          ...ctx,
-          search: action.search || null,
-          share_media: action.share_media === true
+          tenantId, subscriptionPlan,
+          search:      action.search      ?? null,
+          share_media: action.share_media === true,
+          accessToken, phoneNumberId, customerPhone, conversationHistory,
         });
 
+      case 'query_inventory':
+        return await handleQueryInventory(
+          tenantId, subscriptionPlan,
+          action.product_name || extractProductName(message),
+          action.intent,
+        );
+
       case 'show_variations':
-        return await handleShowVariations(ctx);
+        return await handleShowVariations(
+          tenantId, subscriptionPlan,
+          action.product_name || extractLastProduct(conversationHistory),
+        );
 
       case 'create_order':
-        return await handleOrderCreation(tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory);
+        return await handleOrderCreation({
+          tenantId, subscriptionPlan, defaultOnlineStoreId,
+          message, conversationHistory, customerPhone,
+          orderDataFromGemini: action.order_data || null,
+          pendingOrder,
+        });
 
       case 'check_payment':
         return await handlePaymentCheck(tenantId, message);
 
       default:
+        console.warn('[handleAction] unknown action:', action.type);
         return null;
     }
-  } catch (error) {
-    console.error('Error handling action:', error);
+  } catch (err) {
+    console.error('[handleAction] error in', action.type, err?.message);
     return null;
   }
 }
 
-/**
- * Handle inventory query (via backend API) – single product (price, availability, stock)
- */
-async function handleInventoryQuery(tenantId, subscriptionPlan, message, intent, productFromAction) {
-  try {
-    const productName = (productFromAction && String(productFromAction).trim()) || extractProductName(message);
-    if (!productName) {
-      if (intent === 'price') return null;
-      return 'Could you please specify which product you\'re looking for?';
-    }
+// ── List inventory ────────────────────────────────────────────────────────────
+async function handleListInventory({ tenantId, subscriptionPlan, search, share_media,
+    accessToken, phoneNumberId, customerPhone, conversationHistory }) {
 
-    const result = await backendApi.checkProduct(tenantId, productName, subscriptionPlan);
-    if (!result) {
-      return 'Sorry, I couldn\'t check availability. Please try again.';
-    }
+  const result = await backendApi.listProducts(tenantId, subscriptionPlan, {
+    search: search || undefined,
+    limit:  search ? 12 : 20,
+  });
 
-    if (result.exists && result.product) {
-      const p = result.product;
-      const stock = p.stock != null ? p.stock : 0;
-      const priceStr = p.price != null ? formatNaira(p.price) : (p.variations ? 'see variations' : '—');
-      return `✅ ${result.message || 'Product found'}\n\n` +
-             `Product: ${p.name}\n` +
-             `Price: ${priceStr}\n` +
-             `Stock: ${stock} available\n\n` +
-             `Would you like to place an order?`;
-    }
-    return `❌ ${result.message || 'Product not found'}`;
-  } catch (error) {
-    console.error('Error handling inventory query:', error);
-    return 'Sorry, I encountered an error checking availability. Please try again.';
+  if (!result?.products?.length) {
+    return {
+      type: 'replace',
+      text: search
+        ? `We don't have anything matching "${search}" right now. Want to see the full catalog?`
+        : "Catalog's being updated right now. Ask about a specific product and I'll check for you.",
+    };
   }
+
+  const products  = result.products;
+  const base      = (process.env.BACKEND_BASE_URL || process.env.MYCROSHOP_API_URL || 'https://backend.mycroshop.com').replace(/\/$/, '');
+  const toUrl     = url => !url ? null : url.startsWith('http') ? url : `${base}${url.startsWith('/')? '':'/'}${url}`;
+
+  // Send images inline when requested
+  if (share_media && accessToken && phoneNumberId && customerPhone) {
+    const imgs = products.filter(p => toUrl(p.image_url)).slice(0, 5);
+    for (const p of imgs) {
+      const { line } = priceStock(p);
+      await whatsapp.sendImage(phoneNumberId, accessToken, customerPhone, toUrl(p.image_url), `${p.name} – ${line}`)
+        .catch(e => console.error('[list] image fail:', e.message));
+    }
+  }
+
+  // Build readable catalog text
+  let text = '';
+  products.forEach((p, i) => {
+    const { line } = priceStock(p);
+    text += `${i + 1}. ${p.name} – ${line}\n`;
+  });
+  if (products.length > 1) text += '\nWhich one are you interested in?';
+
+  return { type: share_media ? 'append_images' : 'data', text: text.trim() };
 }
 
-/**
- * Handle "show variations" – use last product from conversation and return its variation options.
- */
-async function handleShowVariations(ctx) {
-  const { tenantId, subscriptionPlan, conversationHistory = [] } = ctx;
-  const productName = extractLastProductFromConversation(conversationHistory) || extractProductName(ctx.message);
-  if (!productName) {
-    return null;
+// ── Query specific product ────────────────────────────────────────────────────
+async function handleQueryInventory(tenantId, subscriptionPlan, productName, intent) {
+  if (!productName) return { type: 'replace', text: 'Which product did you want to ask about?' };
+
+  const result = await backendApi.checkProduct(tenantId, productName, subscriptionPlan);
+  if (!result) return { type: 'replace', text: "Couldn't check that right now — try again in a sec." };
+
+  if (result.exists && result.product) {
+    const p          = result.product;
+    const priceStr   = fmtN(p.price);
+    const stockInfo  = p.stock != null ? (p.stock > 0 ? ` ${p.stock} in stock.` : ' Out of stock right now.') : '';
+
+    // Return as 'soft_replace' — only replaces Gemini's reply if it was a placeholder
+    // If Gemini already wrote a real answer (it had PRODUCT DATA), keep Gemini's reply
+    if (intent === 'price') {
+      return { type: 'soft_replace', text: `${p.name} is ${priceStr}.${stockInfo}` };
+    }
+    if (intent === 'availability') {
+      return {
+        type: 'soft_replace',
+        text: p.stock > 0
+          ? `Yeah, we have the ${p.name}. ${stockInfo} It's ${priceStr}.`
+          : `${p.name} is out of stock right now. Want me to let you know when it's back?`,
+      };
+    }
+    return { type: 'soft_replace', text: `${p.name}\n${priceStr}${stockInfo}\n\nWant to order?` };
   }
-  const listResult = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 5 });
-  if (!listResult || !listResult.products || listResult.products.length === 0) {
-    return null;
+
+  // Fuzzy fallback — find similar
+  const similar = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 5 });
+  if (similar?.products?.length) {
+    let text = `Couldn't find "${productName}" exactly, but here's what's close:\n\n`;
+    similar.products.forEach((p, i) => { const { line } = priceStock(p); text += `${i+1}. ${p.name} – ${line}\n`; });
+    return { type: 'replace', text };
   }
-  const p = listResult.products.find(pr => pr.name && pr.name.toLowerCase().includes(productName.toLowerCase())) || listResult.products[0];
-  if (!p.variations || !p.variations.length) {
-    return `${p.name} doesn't have options – single price ${formatNaira(p.price || 0)}. Want to order?`;
+
+  return { type: 'replace', text: `We don't have "${productName}" right now. Want to see the full catalog?` };
+}
+
+// ── Show variations ───────────────────────────────────────────────────────────
+async function handleShowVariations(tenantId, subscriptionPlan, productName) {
+  if (!productName) return null;
+
+  const result = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 5 });
+  if (!result?.products?.length) return null;
+
+  const p = result.products.find(x => x.name?.toLowerCase().includes(productName.toLowerCase()))
+         || result.products[0];
+
+  if (!p.variations?.length) {
+    return { type: 'replace', text: `${p.name} comes in one option — ${fmtN(p.price || 0)}. Want to order?` };
   }
-  let text = `${p.name} – what we have:\n\n`;
+
+  let text = `${p.name} — available options:\n\n`;
   for (const v of p.variations) {
     const opts = (v.options || []).filter(o => o.is_available !== false);
-    if (opts.length && v.variation_name) text += `${v.variation_name}:\n`;
+    if (!opts.length) continue;
+    if (v.variation_name) text += `${v.variation_name}:\n`;
     for (const o of opts) {
-      const price = parseFloat(o.price_adjustment) || 0;
+      const price = parseFloat(o.price_adjustment || o.price) || 0;
       const stock = o.stock != null ? ` (${o.stock} left)` : '';
-      text += `• ${o.option_display_name || o.option_value} – ${formatNaira(price)}${stock}\n`;
+      text += `• ${o.option_display_name || o.option_value} – ${fmtN(price)}${stock}\n`;
     }
+    text += '\n';
   }
-  text += '\nWhich one?';
-  return text;
+  text += 'Which one works for you?';
+  return { type: 'replace', text };
 }
 
+// ── Order creation ────────────────────────────────────────────────────────────
+async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineStoreId,
+    message, conversationHistory, customerPhone, orderDataFromGemini, pendingOrder }) {
+
+  if (!defaultOnlineStoreId) {
+    return { type: 'replace', text: "This store isn't set up for online orders yet. Reach out to the merchant directly." };
+  }
+
+  // Use Gemini's parsed order_data when available — avoids a second AI call
+  let details;
+  if (orderDataFromGemini?.product_name) {
+    details = {
+      items: [{
+        product_name: orderDataFromGemini.product_name,
+        product_id:   orderDataFromGemini.product_id || null,
+        quantity:     orderDataFromGemini.quantity || 1,
+      }],
+      customer_name:    orderDataFromGemini.customer_name    || null,
+      customer_phone:   orderDataFromGemini.customer_phone   || customerPhone,
+      customer_email:   orderDataFromGemini.customer_email   || null,
+      shipping_address: orderDataFromGemini.customer_address || null,
+      ready_to_create: !!(
+        orderDataFromGemini.product_name &&
+        orderDataFromGemini.customer_name &&
+        (orderDataFromGemini.customer_phone || customerPhone) &&
+        orderDataFromGemini.customer_address
+      ),
+    };
+  } else {
+    details = await ai.extractOrderDetails(message, conversationHistory, pendingOrder);
+  }
+
+  if (!details) return { type: 'replace', text: 'What would you like to order?' };
+
+  // Not ready — save what we have and let Gemini's reply ask for the rest
+  if (!details.ready_to_create) {
+    return {
+      type: 'order_pending',
+      pending_order: {
+        items:            details.items || [],
+        customer_name:    details.customer_name,
+        customer_phone:   details.customer_phone || customerPhone,
+        customer_email:   details.customer_email,
+        shipping_address: details.shipping_address,
+      },
+    };
+  }
+
+  // Validate products against backend
+  const validItems = [];
+  for (const item of details.items) {
+    const check = await backendApi.checkProduct(tenantId, item.product_name, subscriptionPlan);
+    if (!check?.exists || !check.product) {
+      return { type: 'replace', text: `"${item.product_name}" isn't available right now. Want to see what we have?` };
+    }
+    const p = check.product;
+    const qty = item.quantity || 1;
+    if (p.stock != null && p.stock < qty) {
+      return { type: 'replace', text: `We only have ${p.stock} of the ${p.name} left — you wanted ${qty}. Want to adjust?` };
+    }
+    validItems.push({ product_id: p.id, product_name: p.name, quantity: qty, price: p.price });
+  }
+
+  const order = await backendApi.createOrder(tenantId, {
+    online_store_id: defaultOnlineStoreId,
+    items: validItems,
+    customer_info: {
+      name:             details.customer_name    || 'WhatsApp Customer',
+      email:            details.customer_email   || '',
+      phone:            details.customer_phone   || customerPhone,
+      shipping_address: details.shipping_address || '',
+    },
+  });
+
+  if (order.success) {
+    const o = order.order;
+    let msg = `✅ Order confirmed!\n\nOrder #${o?.id || o?.order_number || 'N/A'}\n`;
+    if (o?.total != null) msg += `Total: ${fmtN(o.total)}\n`;
+    if (order.paymentLink) msg += `\nPay here 👇\n${order.paymentLink}`;
+    msg += '\n\nOnce payment is confirmed we\'ll process it right away.';
+    return { type: 'replace', text: msg };
+  }
+
+  return { type: 'replace', text: "Ran into an issue placing the order. Give it another try or contact us directly." };
+}
+
+// ── Payment check ─────────────────────────────────────────────────────────────
+async function handlePaymentCheck(tenantId, message) {
+  const ref = extractPaymentRef(message);
+  if (!ref) return { type: 'replace', text: "What's your payment reference? I'll verify it." };
+
+  const result = await backendApi.verifyPayment(tenantId, ref);
+  if (!result?.success) return { type: 'replace', text: "Couldn't look that up right now. Try again in a moment." };
+
+  if (result.paid) {
+    const txn = result.transaction;
+    let msg = `✅ Payment confirmed!\n\nRef: ${txn?.reference || ref}\n`;
+    if (txn?.amount) msg += `Amount: ${fmtN(txn.amount)}\n`;
+    if (result.order?.id) msg += `Order #${result.order.id} is now being processed.`;
+    return { type: 'replace', text: msg };
+  }
+
+  return { type: 'replace', text: `Payment for ref ${ref} hasn't come through yet. Complete the payment and try again.` };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Intent detection + helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
- * Handle list inventory / catalog (via backend API). Optionally send product images via WhatsApp.
+ * Determine whether to pre-fetch inventory before calling Gemini.
+ * Returns { needed: bool, search: string|null }
+ *
+ * We pre-fetch when the customer is asking about products so Gemini has
+ * real data and can write a complete, accurate reply in one shot.
  */
-function formatProductPriceAndStock(p) {
-  if (p.variations && Array.isArray(p.variations) && p.variations.length > 0) {
-    let minPrice = null;
-    let totalStock = 0;
+function detectInventoryIntent(message, conversationHistory, orderState) {
+  // Don't fetch during active order collection — it's just detail gathering
+  if (orderState === 'collecting_details' || orderState === 'confirming') {
+    return { needed: false, search: null };
+  }
+
+  const m = message.toLowerCase();
+
+  // Generic product/catalog queries
+  const genericPatterns = [
+    /\b(what.*you have|what.*you got|what.*you sell|your products|your catalog|your items|price list|send.*catalog|show.*products|show.*items|wetin.*you get|watin.*you get|what.*in stock|see.*products)\b/,
+    /\b(catalog|inventory|list|browse)\b/,
+  ];
+  if (genericPatterns.some(p => p.test(m))) {
+    return { needed: true, search: null }; // full catalog
+  }
+
+  // Specific category or product search
+  const specificPatterns = [
+    /(?:show me|you have|do you have|got any|any|see|find)\s+(?:the\s+|some\s+)?([a-z][a-z0-9 ]{1,30}?)(?:\?|$|\.|please)/i,
+    /(?:how much is|price of|cost of|how much for)\s+(?:the\s+)?([a-z][a-z0-9 ]{1,30}?)(?:\?|$|\.)/i,
+    /(?:picture|photo|image)s?\s+(?:of\s+)?(?:the\s+)?([a-z][a-z0-9 ]{1,30}?)(?:\?|$|\.)/i,
+  ];
+  const skipTerms = /^(me|your|the|a|an|any|some|picture|photo|image|catalog|products|items|stuff|price|prices)$/i;
+
+  for (const p of specificPatterns) {
+    const match = message.match(p);
+    if (match?.[1] && !skipTerms.test(match[1].trim())) {
+      return { needed: true, search: match[1].trim() };
+    }
+  }
+
+  // Price/availability/stock questions
+  if (/\b(price|cost|how much|available|in stock|e dey|do you have|you get)\b/.test(m)) {
+    return { needed: true, search: null };
+  }
+
+  // Picture requests (use context for search term)
+  if (/\b(picture|photo|image|pic)\b/.test(m)) {
+    const lastProduct = extractLastProduct(conversationHistory);
+    return { needed: true, search: lastProduct };
+  }
+
+  return { needed: false, search: null };
+}
+
+/** Format products as readable text for prompt injection */
+function formatProductsForPrompt(products) {
+  return products.slice(0, 20).map((p, i) => {
+    const { line } = priceStock(p);
+    return `${i + 1}. ${p.name} – ${line}`;
+  }).join('\n');
+}
+
+/** Format price and stock for one product */
+function priceStock(p) {
+  if (p.variations?.length) {
+    let min = null, total = 0;
     for (const v of p.variations) {
-      for (const opt of v.options || []) {
-        const adj = parseFloat(opt.price_adjustment);
-        if (!isNaN(adj) && (minPrice === null || adj < minPrice)) minPrice = adj;
-        if (opt.stock != null) totalStock += Number(opt.stock);
+      for (const o of (v.options || [])) {
+        const n = parseFloat(o.price_adjustment || o.price);
+        if (!isNaN(n) && (min === null || n < min)) min = n;
+        if (o.stock != null) total += Number(o.stock);
       }
     }
-    if (minPrice !== null) {
-      const stockStr = totalStock > 0 ? ` (${totalStock} in stock)` : '';
-      return { line: `from ${formatNaira(minPrice)}${stockStr}`, priceNum: minPrice };
-    }
-    const varNames = p.variations.map(v => v.variation_name).filter(Boolean).join(', ') || 'options';
-    return { line: `various ${varNames}`, priceNum: 0 };
+    if (min !== null) return { line: `from ${fmtN(min)}${total > 0 ? ` (${total} in stock)` : ''}`, priceNum: min };
+    return { line: 'multiple options', priceNum: 0 };
   }
   const price = parseFloat(p.price || 0);
-  const stockStr = p.stock != null ? ` (${p.stock} in stock)` : '';
-  return { line: `${formatNaira(price)}${stockStr}`, priceNum: price };
+  const stock = p.stock != null ? ` (${p.stock} in stock)` : '';
+  return { line: `${fmtN(price)}${stock}`, priceNum: price };
 }
 
-async function handleListInventory(ctx) {
-  const {
-    tenantId,
-    subscriptionPlan,
-    message,
-    accessToken,
-    phoneNumberId,
-    customerPhone,
-    conversationHistory = [],
-    search: actionSearch = null,
-    share_media = false
-  } = ctx;
-  try {
-    // Prefer explicit search term from Gemini action; fall back to heuristic extraction only when missing
-    let search = (typeof actionSearch === 'string' && actionSearch.trim()) ? actionSearch.trim() : null;
-    if (!search) {
-      search = extractProductName(message) || extractSearchTerm(message);
-      search = normalizeSearchTerm(search);
-      if (isMediaOnlyWord(search)) search = undefined;
-      if (isContextReference(search)) search = undefined;
-      if (!search && (isGenericPictureRequest(message) || isContextReference(extractProductName(message) || extractSearchTerm(message)))) {
-        search = extractLastProductFromConversation(conversationHistory) || extractLastMentionedProductFromHistory(conversationHistory) || undefined;
-      }
-    }
-    const listResult = await backendApi.listProducts(tenantId, subscriptionPlan, {
-      search: search || undefined,
-      limit: search ? 10 : 15
-    });
-
-    if (!listResult || !listResult.products || listResult.products.length === 0) {
-      return search
-        ? `We don't have any products matching "${search}" right now. Try another search or ask for our full catalog.`
-        : 'We don\'t have any products in the catalog at the moment. Check back later!';
-    }
-
-    const products = listResult.products;
-    const backendBaseUrl = (process.env.BACKEND_BASE_URL || process.env.MYCROSHOP_API_URL || 'https://backend.mycroshop.com').replace(/\/$/, '');
-    const toFullImageUrl = (url) => {
-      if (!url) return null;
-      if (url.startsWith('http')) return url;
-      return `${backendBaseUrl}${url.startsWith('/') ? '' : '/'}${url}`;
-    };
-    const withImages = products.filter(p => toFullImageUrl(p.image_url));
-
-    if (share_media && withImages.length > 0 && accessToken && phoneNumberId && customerPhone) {
-      const maxImages = 5;
-      const toSend = withImages.slice(0, maxImages);
-      for (const p of toSend) {
-        const imageUrl = toFullImageUrl(p.image_url);
-        const { line } = formatProductPriceAndStock(p);
-        const caption = `${p.name} – ${line}`;
-        try {
-          await whatsapp.sendImage(phoneNumberId, accessToken, customerPhone, imageUrl, caption);
-        } catch (err) {
-          console.error('Error sending product image:', err.message);
-        }
-      }
-    }
-
-    const singleProduct = products.length === 1 && search;
-    let text = singleProduct
-      ? `📦 Here’s ${products[0].name}:\n\n`
-      : `📦 Here are our products${search ? ` matching "${search}"` : ''}:\n\n`;
-    products.forEach((p, i) => {
-      const { line } = formatProductPriceAndStock(p);
-      text += `${i + 1}. ${p.name} – ${line}\n`;
-    });
-    text += '\nWould you like details on any product or to place an order?';
-    return text;
-  } catch (error) {
-    console.error('Error handling list inventory:', error);
-    return 'Sorry, I couldn\'t load the catalog. Please try again.';
-  }
-}
-
-function extractSearchTerm(message) {
-  const m = (message || '').toLowerCase();
-  const patterns = [
-    /(?:show|list|get|send|see).*?(?:products?|items?|catalog|inventory)\s+(?:for|about|like)?\s*[:\-]?\s*(.+?)(?:\?|$|\.)/i,
-    /(?:what|which)\s+(?:products?|items?).*?(?:have|offer|sell)\s+(?:for|about)?\s*(.+?)(?:\?|$|\.)/i,
-    /(?:search|find)\s+(.+?)(?:\?|$|\.)/i
-  ];
-  for (const pattern of patterns) {
-    const match = (message || '').match(pattern);
-    if (match && match[1]) return match[1].trim();
-  }
-  return null;
-}
-
-/**
- * Handle order creation (via backend API)
- */
-async function handleOrderCreation(tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory) {
-  try {
-    const orderDetails = await ai.extractOrderDetails(message, conversationHistory);
-
-    if (!orderDetails || !orderDetails.items || orderDetails.items.length === 0) {
-      return 'I need more information to create your order. Please tell me:\n' +
-             '1. What products you want\n' +
-             '2. How many of each\n' +
-             '3. Your name and contact details';
-    }
-
-    if (!defaultOnlineStoreId) {
-      return 'Sorry, this store has no online store configured. Please contact the merchant.';
-    }
-
-    const validatedItems = [];
-    for (const item of orderDetails.items) {
-      const result = await backendApi.checkProduct(tenantId, item.product_name, subscriptionPlan);
-      if (!result || !result.exists || !result.product) {
-        return `Sorry, "${item.product_name}" is not available. ${(result && result.message) || ''}`;
-      }
-      const p = result.product;
-      const qty = item.quantity || 1;
-      const stock = p.stock != null ? p.stock : 0;
-      if (stock < qty) {
-        return `Sorry, "${p.name}" has only ${stock} in stock. You requested ${qty}.`;
-      }
-      validatedItems.push({
-        product_id: p.id,
-        product_name: p.name,
-        quantity: qty,
-        price: p.price
-      });
-    }
-
-    const orderResult = await backendApi.createOrder(tenantId, {
-      online_store_id: defaultOnlineStoreId,
-      items: validatedItems,
-      customer_info: {
-        name: orderDetails.customer_name || 'WhatsApp Customer',
-        email: orderDetails.customer_email || '',
-        phone: orderDetails.customer_phone || '',
-        shipping_address: orderDetails.shipping_address || ''
-      }
-    });
-
-    if (orderResult.success) {
-      return formatOrderConfirmation(orderResult.order, orderResult.paymentLink);
-    }
-    return 'Sorry, I encountered an error creating your order. Please try again.';
-  } catch (error) {
-    console.error('Error handling order creation:', error);
-    return 'Sorry, I encountered an error creating your order. Please try again or contact support.';
-  }
-}
-
-function formatOrderConfirmation(order, paymentLink) {
-  let msg = `✅ Order created!\n\nOrder #${order?.id || order?.order_number || 'N/A'}\n`;
-  if (order?.total != null) {
-    msg += `Total: ₦${parseFloat(order.total).toLocaleString()}\n`;
-  }
-  if (paymentLink) {
-    msg += `\nPay here: ${paymentLink}`;
-  }
-  return msg;
-}
-
-/**
- * Handle payment check (via backend API)
- */
-async function handlePaymentCheck(tenantId, message) {
-  try {
-    const reference = extractPaymentReference(message);
-    if (!reference) {
-      return 'Please provide your payment reference number to check payment status.';
-    }
-
-    const paymentResult = await backendApi.verifyPayment(tenantId, reference);
-    return payments.formatPaymentConfirmation(paymentResult);
-  } catch (error) {
-    console.error('Error handling payment check:', error);
-    return 'Sorry, I encountered an error checking your payment. Please try again.';
-  }
-}
-
-/**
- * Send WhatsApp response (access token from resolve-tenant, no DB)
- */
-async function sendWhatsAppResponse(phoneNumberId, to, message, accessToken) {
-  if (!accessToken) {
-    throw new Error('Access token not found for phone number');
-  }
-  await whatsapp.sendMessage(phoneNumberId, accessToken, to, message);
-}
-
-/** Format amount as Naira (₦) with thousands separator and optional decimals */
-function formatNaira(amount) {
+/** Format Naira */
+function fmtN(amount) {
   const n = Number(amount);
   if (isNaN(n)) return '₦0';
   return '₦' + n.toLocaleString('en-NG', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
-/** Words that mean "photos/pictures" — never use these as product search terms */
-const MEDIA_WORDS = new Set(['image', 'images', 'picture', 'pictures', 'photo', 'photos', 'pic', 'pics']);
-
-/** Phrases that refer to "what we were just discussing" — use chat history, not as search term */
-const CONTEXT_REFERENCE_PHRASES = new Set([
-  'ones you have', 'the ones you have', 'what you have', 'what you showed', 'the ones you showed',
-  'that one', 'those', 'the ones', 'your options', 'your selection', 'what you got', 'the options'
-]);
-
-function isMediaOnlyWord(term) {
-  if (!term || typeof term !== 'string') return false;
-  return MEDIA_WORDS.has(term.trim().toLowerCase());
-}
-
-function isContextReference(term) {
-  if (!term || typeof term !== 'string') return false;
-  const t = term.trim().toLowerCase();
-  if (CONTEXT_REFERENCE_PHRASES.has(t)) return true;
-  if (/^(the\s+)?ones\s+(you\s+)?have$/i.test(t)) return true;
-  if (/^what\s+you\s+(have|showed|got)$/i.test(t)) return true;
-  if (/\bones\s+you\s+have\b/i.test(t) || /\bwhat\s+you\s+have\b/i.test(t)) return true;
-  return false;
+/** Is this reply a placeholder that should be replaced by real data? */
+function isPlaceholder(text) {
+  return /^(on it|sure|ok|checking|let me|pulling|one sec|hold on|gimme|alright|yeah)/i.test((text || '').trim());
 }
 
 /**
- * Normalize search term: "sneakers you have" → "sneakers", "pictures you have" → undefined (media word).
- * Stops the AI from searching for literal "sneakers you have" or "pictures you have" as a product name.
+ * Merge Gemini's intro with backend catalog data.
+ *
+ * Rules:
+ * 1. If Gemini already has prices/products in its reply → it used the injected data → DON'T append (would duplicate)
+ * 2. If Gemini wrote a short placeholder (1-2 lines, no prices) → append the real data
+ * 3. If Gemini wrote a full multi-line reply without prices → trust it, don't append
  */
-function normalizeSearchTerm(search) {
-  if (!search || typeof search !== 'string') return undefined;
-  let t = search.trim();
-  const lower = t.toLowerCase();
-  const stripSuffix = (suffix) => {
-    const re = new RegExp('\\s*' + suffix.replace(/\s+/g, '\\s+') + '\\s*$', 'i');
-    if (re.test(t)) return t.replace(re, '').trim();
-    return null;
-  };
-  const stripped = stripSuffix('you have') || stripSuffix('you got') || stripSuffix('you showed') || stripSuffix('the ones you have');
-  if (stripped !== null) t = stripped;
-  t = t.replace(/^\s*the\s+/i, '').trim();
-  if (!t) return undefined;
-  if (isMediaOnlyWord(t)) return undefined;
-  if (isContextReference(t)) return undefined;
-  return t;
+function mergeIntroAndData(geminiReply, dataText) {
+  if (!geminiReply?.trim()) return dataText;
+  if (!dataText?.trim())    return geminiReply;
+
+  const reply = geminiReply.trim();
+
+  // Gemini already wrote product data (has ₦ prices) — don't duplicate
+  if (reply.includes('₦')) return reply;
+
+  // Gemini already has a numbered list — don't duplicate
+  if (/^\d+\.\s/m.test(reply)) return reply;
+
+  // Gemini wrote a multi-line substantive reply — trust it
+  if (reply.split('\n').length > 3) return reply;
+
+  // Short intro or placeholder — append the catalog data below it
+  return `${reply}\n\n${dataText.trim()}`;
 }
 
-/** Check if message is a generic "show picture" or "show me what you have" (use chat history) */
-function isGenericPictureRequest(message) {
-  if (!message || typeof message !== 'string') return false;
-  const m = message.trim().toLowerCase();
-  if (/^(\s*yes\s*)$/i.test(m)) return true;
-  if (/^(yes\s+)?(let me see|show me|send me|i want to see|can i see)\s+(?:the\s+)?(picture|image|photo)s?\.?$/i.test(m)) return true;
-  if (/^(yes\s+)?(picture|image|photo)s?\.?$/i.test(m)) return true;
-  if (/(?:let me see|show me|can i see)\s+(?:the\s+)?(?:images?|pictures?|photos?)\s+of\s+(?:the\s+)?ones\s+you\s+have/i.test(m)) return true;
-  if (/(?:let me see|show me|can i see)\s+(?:the\s+)?(?:images?|pictures?)\s+of\s+what\s+you\s+have/i.test(m)) return true;
-  if (/(?:let me see|show me|can i see)\s+(?:the\s+)?(?:pictures?|images?|photos?)\s+(?:you\s+)?have/i.test(m)) return true;
-  return false;
-}
-
-/**
- * Get the last product name mentioned by the user in conversation history.
- */
-function extractLastMentionedProductFromHistory(conversationHistory) {
-  if (!Array.isArray(conversationHistory) || conversationHistory.length === 0) return null;
-  const recent = conversationHistory.slice(-8).reverse();
-  for (const msg of recent) {
-    if (msg.role === 'user' && msg.text) {
-      const name = extractProductName(msg.text);
-      if (name && !isContextReference(name) && !isMediaOnlyWord(name)) return name;
-    }
-  }
-  return null;
-}
-
-/**
- * Get the last product name from the whole conversation (user or assistant), e.g. for "show variations".
- */
-function extractLastProductFromConversation(conversationHistory) {
-  const fromUser = extractLastMentionedProductFromHistory(conversationHistory);
-  if (fromUser) return fromUser;
-  if (!Array.isArray(conversationHistory) || conversationHistory.length === 0) return null;
-  const recent = conversationHistory.slice(-8).reverse();
-  for (const msg of recent) {
-    if (msg.role === 'assistant' && msg.text) {
-      const t = msg.text;
-      const lines = t.split(/\n/);
-      for (const line of lines) {
-        const trimmed = line.trim();
-        const hereMatch = trimmed.match(/(?:Here's?|Sending you)\s+([^:!.\n–\-]+?)(?:\s*[:\-]|!|\.|$)/i);
-        if (hereMatch && hereMatch[1]) return hereMatch[1].trim();
-        const listMatch = trimmed.match(/^\d+\.\s+([^–\-]+?)\s+[–\-]\s+(?:from\s+)?₦/);
-        if (listMatch && listMatch[1]) return listMatch[1].trim();
-        const inlineMatch = trimmed.match(/^([A-Za-z0-9\s]+?)\s+[–\-]\s+from\s+₦/);
-        if (inlineMatch && inlineMatch[1]) return inlineMatch[1].trim();
-        const dashOnly = trimmed.match(/^([A-Za-z0-9\s]{2,50}?)\s+[–\-]\s+(?:from\s+)?(?:₦|N)/);
-        if (dashOnly && dashOnly[1]) return dashOnly[1].trim();
-      }
-      const m = t.match(/(?:Here's?|Sending you)\s+([^:!.\n]+?)(?:\s*[:\-]|!|\.|\n|$)/i);
-      if (m && m[1]) return m[1].trim();
-      const m2 = t.match(/\d+\.\s+([^–\-]+?)\s+[–\-]\s+(?:from\s+)?₦/);
-      if (m2 && m2[1]) return m2[1].trim();
-      const m3 = t.match(/([A-Za-z0-9\s]+?)\s+[–\-]\s+from\s+₦/);
-      if (m3 && m3[1]) return m3[1].trim();
-      const m4 = t.match(/([A-Za-z0-9\s]{2,50})\s+[–\-]\s+(?:from\s+)?(?:₦|N\d)/);
-      if (m4 && m4[1]) return m4[1].trim();
-    }
-  }
-  return null;
-}
-
-/**
- * Extract product name from message (all permutations: availability, price, cost, order, image of X, etc.)
- */
+/** Extract a product name from customer message */
 function extractProductName(message) {
-  if (!message || typeof message !== 'string') return null;
-  const m = message.trim();
-
+  if (!message) return null;
   const patterns = [
-    // "image/picture/photo of X" — user wants to see a specific product's image (must come first)
-    /(?:can i see|show me|send me|i want to see|let me see|send)\s+(?:the\s+)?(?:product\s+)?(?:image|picture|photo|pic)s?\s+(?:of\s+)(?:the\s+)?(.+?)(?:\?|$|\.)/i,
-    /(?:image|picture|photo|pic)s?\s+(?:of\s+)(?:the\s+)?(.+?)(?:\?|$|\.)/i,
-    // "let me see X" / "show me X" — product by name (must check inventory; do not assume by name)
-    /(?:let me see|show me)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
-    // Price / cost
-    /(?:how much (?:is|for|does)\s+)(?:the\s+)?(.+?)(?:\s+cost|\s+go\s+for|\?|$|\.)/i,
-    /(?:price|cost|amount)\s+(?:of|for)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
-    /(?:what('s| is) the (?:price|cost)\s+)(?:of\s+)?(?:the\s+)?(.+?)(?:\?|$|\.)/i,
-    /(?:how much (?:does)\s+)(?:the\s+)?(.+?)(?:\s+cost|\?|$|\.)/i,
-    /(?:what does)\s+(?:the\s+)?(.+?)(?:\s+cost|\s+go\s+for|\?|$|\.)/i,
-    /(?:how much for)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
-    // Availability / have / stock
-    /(?:do you have|is|are)\s+(?:there\s+)?(?:any\s+)?(?:the\s+)?(.+?)(?:\s+(?:in stock|available|\?)|$|\.)/i,
-    /(?:show me|i want|i need|looking for)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
-    /(?:product|item)\s+(.+?)(?:\?|$|\.)/i,
-    /(?:tell me about|details on|info on|what is)\s+(?:the\s+)?(.+?)(?:\?|$|\.)/i,
-    // Order
-    /(?:i want to buy|get me|i need)\s+(?:some\s+)?(?:the\s+)?(.+?)(?:\?|$|\.)/i,
-    /(?:order|buy)\s+(?:some\s+)?(?:the\s+)?(.+?)(?:\?|$|\.)/i
+    /(?:price|cost|how much|available|in stock|do you have|show me|order|buy)\s+(?:of|for|is|the)?\s*(?:the\s+)?([A-Za-z0-9 ]{2,50}?)(?:\?|$|\.)/i,
+    /(?:image|picture|photo)\s+of\s+(?:the\s+)?([A-Za-z0-9 ]{2,50}?)(?:\?|$|\.)/i,
   ];
-
-  for (const pattern of patterns) {
-    const match = m.match(pattern);
-    if (match && match[1]) {
-      const name = match[1].trim();
-      if (name.length > 0 && name.length < 120 && !isMediaOnlyWord(name)) return name;
-    }
+  for (const p of patterns) {
+    const m = message.match(p);
+    if (m?.[1]?.trim().length > 1) return m[1].trim();
   }
-
   return null;
 }
 
-/**
- * Extract payment reference from message
- */
-function extractPaymentReference(message) {
-  // Look for reference patterns
-  const patterns = [
-    /(?:reference|ref|payment ref|txn ref)[\s:]+([A-Z0-9]+)/i,
-    /([A-Z0-9]{8,})/ // Generic alphanumeric code
-  ];
-
-  for (const pattern of patterns) {
-    const match = message.match(pattern);
-    if (match && match[1]) {
-      return match[1].trim();
+/** Get last product mentioned in conversation (for context-based requests) */
+function extractLastProduct(history) {
+  if (!Array.isArray(history)) return null;
+  for (const msg of [...history].reverse().slice(0, 12)) {
+    if (!msg.text) continue;
+    // Numbered list item: "1. Air Max – ₦25,000"
+    const list = msg.text.match(/\d+\.\s+([^–\-\n]{2,50}?)\s+[–\-]/);
+    if (list?.[1]) return list[1].trim();
+    // "Here you go" / "Here's the X" patterns
+    if (msg.role === 'assistant') {
+      const here = msg.text.match(/(?:here(?:'s| are the| you go)|sending the)\s+([^:\n.!]{2,50})/i);
+      if (here?.[1]) return here[1].trim();
+    }
+    // User asked about a product
+    if (msg.role === 'user') {
+      const name = extractProductName(msg.text);
+      if (name) return name;
     }
   }
-
   return null;
 }
 
-/**
- * Schedule follow-up (e.g. abandoned cart, payment reminder).
- * No-op when not using Cloud Scheduler; can be wired to a job queue later.
- */
-async function checkAndScheduleFollowUp() {
-  // Optional: call Cloud Scheduler or internal queue when running on Google Cloud
+/** Extract payment reference from message */
+function extractPaymentRef(message) {
+  const patterns = [
+    /(?:reference|ref|txn|payment)[:\s#]+([A-Z0-9]{5,})/i,
+    /\b([A-Z]{2,}[0-9]{4,})\b/,
+    /\b([0-9]{6,}[A-Z]{2,})\b/i,
+  ];
+  for (const p of patterns) {
+    const m = message.match(p);
+    if (m?.[1]) return m[1].trim();
+  }
+  return null;
+}
+
+/** Fire-and-forget send that never crashes the main flow */
+async function safeSend(phoneNumberId, to, accessToken, text) {
+  if (!accessToken || !phoneNumberId || !to) return;
+  await whatsapp.sendMessage(phoneNumberId, accessToken, to, text)
+    .catch(e => console.error('[safeSend]', e.message));
 }
 
 module.exports = { processMessage };
-
