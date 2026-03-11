@@ -239,6 +239,8 @@ async function processMessage(messageData) {
         } else if (result.text) {
           finalReply = mergeIntroAndData(finalReply, result.text);
         }
+      } else if (result.type === 'noop') {
+        // Action completed (e.g. images sent) but no text change needed — leave finalReply as-is
       }
     }
 
@@ -408,14 +410,28 @@ async function handleListInventory({ tenantId, subscriptionPlan, search, share_m
   });
   if (products.length > 1) text += '\nWhich one are you interested in?';
 
-  return { type: share_media ? 'append_images' : 'data', text: text.trim() };
+  // If images were sent, don't send a separate catalog text dump after them.
+  // The image captions already show product name + price.
+  // Gemini's reply (sent before the images) is the intro.
+  if (share_media) {
+    return { type: 'noop', text: '' };
+  }
+
+  return { type: 'data', text: text.trim() };
 }
 
 // ── Query specific product ────────────────────────────────────────────────────
 async function handleQueryInventory({ tenantId, subscriptionPlan, productName, intent,
     share_media = true, accessToken, phoneNumberId, customerPhone }) {
 
-  if (!productName) return { type: 'replace', text: 'Which product were you asking about?' };
+  if (!productName) {
+    // Try to extract from recent conversation before giving up
+    // This handles cases like: AI asked "casual or formal?" → user said "casual" → AI calls
+    // query_inventory with no product_name because it lost context.
+    // In this case, return null so Gemini's own reply is used as-is.
+    console.warn('[queryInventory] called with no product_name — skipping action, using Gemini reply');
+    return null;
+  }
 
   const base  = (process.env.BACKEND_BASE_URL || process.env.MYCROSHOP_API_URL || 'https://backend.mycroshop.com').replace(/\/$/, '');
   const toUrl = url => !url ? null : url.startsWith('http') ? url : `${base}${url.startsWith('/') ? '' : '/'}${url}`;
@@ -471,7 +487,25 @@ async function handleQueryInventory({ tenantId, subscriptionPlan, productName, i
   }
 
   // ── We have the product — build the rich response ────────────────────────
-  const priceStr  = fmtN(product.price);
+
+  // Compute display price — for variation-only products, product.price is null.
+  // Show the cheapest variation price as "from ₦X" instead of ₦0.
+  const hasVariations = product.variations?.length > 0;
+  let priceStr;
+  if (!product.price && hasVariations) {
+    // Find cheapest option across all variations
+    let minPrice = null;
+    for (const v of product.variations) {
+      for (const o of (v.options || [])) {
+        const n = parseFloat(o.price_adjustment || o.price);
+        if (!isNaN(n) && n > 0 && (minPrice === null || n < minPrice)) minPrice = n;
+      }
+    }
+    priceStr = minPrice !== null ? `from ${fmtN(minPrice)}` : 'see options below';
+  } else {
+    priceStr = fmtN(product.price || 0);
+  }
+
   const stockNum  = product.stock;
   const stockInfo = stockNum != null
     ? (stockNum > 0 ? `${stockNum} in stock` : 'Out of stock')
@@ -485,36 +519,36 @@ async function handleQueryInventory({ tenantId, subscriptionPlan, productName, i
       .catch(e => console.error('[queryInventory] image send failed:', e.message));
   }
 
-  // 2. Build detail + variations text
+  // 2. Build variations text (only — Gemini already wrote the intro reply)
+  // We do NOT repeat the price/stock Gemini already said. Just show the options.
   let text = '';
 
-  if (product.description && product.description.trim()) {
-    text += `${product.description.trim()}\n\n`;
-  }
-
-  text += `💰 Price: ${priceStr}`;
-  if (stockInfo) text += `\n📦 Stock: ${stockInfo}`;
-
-  // 3. Append variations if present
-  if (product.variations?.length) {
-    text += '\n\n';
+  if (hasVariations) {
     for (const v of product.variations) {
       const opts = (v.options || []).filter(o => o.is_available !== false);
       if (!opts.length) continue;
       if (v.variation_name) text += `${v.variation_name}:\n`;
       for (const o of opts) {
-        const price = parseFloat(o.price_adjustment || o.price) || parseFloat(product.price) || 0;
+        const optPrice = parseFloat(o.price_adjustment || o.price);
+        const basePrice = parseFloat(product.price);
+        // price_adjustment = add-on to base price; price = absolute price for this option
+        const finalPrice = !isNaN(optPrice) && optPrice > 0
+          ? (o.price_adjustment && !isNaN(basePrice) && basePrice > 0
+              ? basePrice + optPrice   // adjustment on top of base
+              : optPrice)              // absolute option price
+          : (!isNaN(basePrice) && basePrice > 0 ? basePrice : null);
         const oStock = o.stock != null ? ` (${o.stock} left)` : '';
-        text += `• ${o.option_display_name || o.option_value} — ${fmtN(price)}${oStock}\n`;
+        const priceDisplay = finalPrice !== null ? ` — ${fmtN(finalPrice)}` : '';
+        text += `• ${o.option_display_name || o.option_value}${priceDisplay}${oStock}\n`;
       }
       text += '\n';
     }
-    text = text.trimEnd() + '\n\nWhich option works for you?';
-  } else {
-    text += '\n\nWant to order?';
+    if (text.trim()) text = text.trimEnd() + '\n\nWhich works for you?';
   }
 
-  return { type: 'replace', text };
+  // Return as soft_replace so it only appends if Gemini didn't already have the data
+  // The image was already sent above; this text goes as the follow-up message
+  return { type: text ? 'soft_replace' : 'noop', text: text || '' };
 }
 
 // ── Show variations ───────────────────────────────────────────────────────────
