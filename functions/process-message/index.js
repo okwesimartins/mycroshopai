@@ -217,6 +217,7 @@ async function processMessage(messageData) {
     let finalReply    = aiResponse.text || '';
     let newOrderState = aiResponse.order_state || orderState;
     let newPending    = pendingOrder;
+    let pendingImages = []; // images to send AFTER the text reply
 
     // Safety net: if Gemini emits list_inventory with share_media for a contextual picture request,
     // convert it to query_inventory for the specific product so we don't dump the whole catalog
@@ -270,6 +271,28 @@ async function processMessage(messageData) {
         } else if (result.text) {
           finalReply = mergeIntroAndData(finalReply, result.text);
         }
+      } else if (result.type === 'catalog_media') {
+        // Catalog with images — Gemini's intro text is the reply, images come after
+        if (result.images?.length) {
+          pendingImages.push(...result.images);
+        }
+
+      } else if (result.type === 'product_card') {
+        // Product query result — structured: text reply first, image after.
+        // Sequence: 1) finalReply (Gemini intro + variations) sent as text
+        //           2) image sent immediately after
+        // This way customer reads the full context before the image loads.
+        if (result.variationsText) {
+          // Merge variations into Gemini's reply if Gemini didn't already include them
+          if (!finalReply.includes('•') && !finalReply.includes('Which works')) {
+            finalReply = finalReply.trimEnd() + '\n\n' + result.variationsText;
+          }
+        }
+        // Store image info to send after the text reply
+        if (result.imageUrl) {
+          pendingImages.push({ url: result.imageUrl, caption: result.imageCaption });
+        }
+
       } else if (result.type === 'noop') {
         // Action completed (e.g. images sent) but no text change needed — leave finalReply as-is
       }
@@ -324,10 +347,19 @@ async function processMessage(messageData) {
     ]).catch(() => {}); // outer catch — absolutely never let a save failure kill the send
 
     // ── Send to customer ─────────────────────────────────────────────────
+    // TEXT FIRST — customer reads full context (price, variations, question)
     // Pass messageId so the reply is tagged to the customer's original message
-    // — they see it quoted in the chat, making context clear
     await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, finalReply, messageId)
       .catch(e => { logErr('send', e); throw e; });
+
+    // IMAGES AFTER TEXT — loads after customer has already read the context
+    // Parallel send for multiple images
+    if (pendingImages.length > 0) {
+      await Promise.all(pendingImages.map(img =>
+        whatsapp.sendImage(phoneNumberId, accessToken, customerPhone, img.url, img.caption)
+          .catch(e => logErr('sendImage', e))
+      ));
+    }
 
     // ── Remaining writes — fire and forget ───────────────────────────────
     // Order state and dedup are less time-sensitive — fine to write in background.
@@ -441,17 +473,6 @@ async function handleListInventory({ tenantId, subscriptionPlan, search, share_m
   const base      = (process.env.BACKEND_BASE_URL || process.env.MYCROSHOP_API_URL || 'https://backend.mycroshop.com').replace(/\/$/, '');
   const toUrl     = url => !url ? null : url.startsWith('http') ? url : `${base}${url.startsWith('/')? '':'/'}${url}`;
 
-  // Send images inline when requested
-  if (share_media && accessToken && phoneNumberId && customerPhone) {
-    const imgs = products.filter(p => toUrl(p.image_url)).slice(0, 5);
-    // Send all images in parallel — saves N×200ms vs sequential loop
-    await Promise.all(imgs.map(p => {
-      const { line } = priceStock(p);
-      return whatsapp.sendImage(phoneNumberId, accessToken, customerPhone, toUrl(p.image_url), `${p.name} – ${line}`)
-        .catch(e => console.error('[list] image fail:', e.message));
-    }));
-  }
-
   // Build readable catalog text
   let text = '';
   products.forEach((p, i) => {
@@ -460,11 +481,13 @@ async function handleListInventory({ tenantId, subscriptionPlan, search, share_m
   });
   if (products.length > 1) text += '\nWhich one are you interested in?';
 
-  // If images were sent, don't send a separate catalog text dump after them.
-  // The image captions already show product name + price.
-  // Gemini's reply (sent before the images) is the intro.
   if (share_media) {
-    return { type: 'noop', text: '' };
+    // Return image URLs to the main flow — images sent AFTER text, not before
+    const imgs = products
+      .filter(p => toUrl(p.image_url))
+      .slice(0, 5)
+      .map(p => ({ url: toUrl(p.image_url), caption: `${p.name} – ${priceStock(p).line}` }));
+    return { type: 'catalog_media', images: imgs };
   }
 
   return { type: 'data', text: text.trim() };
@@ -566,44 +589,39 @@ async function handleQueryInventory({ tenantId, subscriptionPlan, productName, i
     ? (stockNum > 0 ? `${stockNum} in stock` : 'Out of stock')
     : '';
 
-  // 1. Send product image if available and requested
-  const imageUrl = toUrl(product.image_url || product.imageUrl);
-  if (share_media && imageUrl && accessToken && phoneNumberId && customerPhone) {
-    const caption = `${product.name} — ${priceStr}${stockInfo ? ` | ${stockInfo}` : ''}`;
-    await whatsapp.sendImage(phoneNumberId, accessToken, customerPhone, imageUrl, caption)
-      .catch(e => console.error('[queryInventory] image send failed:', e.message));
-  }
-
-  // 2. Build variations text (only — Gemini already wrote the intro reply)
-  // We do NOT repeat the price/stock Gemini already said. Just show the options.
-  let text = '';
-
+  // Build variations text
+  let variationsText = '';
   if (hasVariations) {
     for (const v of product.variations) {
       const opts = (v.options || []).filter(o => o.is_available !== false);
       if (!opts.length) continue;
-      if (v.variation_name) text += `${v.variation_name}:\n`;
+      if (v.variation_name) variationsText += `${v.variation_name}:\n`;
       for (const o of opts) {
         const optPrice = parseFloat(o.price_adjustment || o.price);
         const basePrice = parseFloat(product.price);
-        // price_adjustment = add-on to base price; price = absolute price for this option
         const finalPrice = !isNaN(optPrice) && optPrice > 0
           ? (o.price_adjustment && !isNaN(basePrice) && basePrice > 0
-              ? basePrice + optPrice   // adjustment on top of base
-              : optPrice)              // absolute option price
+              ? basePrice + optPrice
+              : optPrice)
           : (!isNaN(basePrice) && basePrice > 0 ? basePrice : null);
         const oStock = o.stock != null ? ` (${o.stock} left)` : '';
         const priceDisplay = finalPrice !== null ? ` — ${fmtN(finalPrice)}` : '';
-        text += `• ${o.option_display_name || o.option_value}${priceDisplay}${oStock}\n`;
+        variationsText += `• ${o.option_display_name || o.option_value}${priceDisplay}${oStock}\n`;
       }
-      text += '\n';
+      variationsText += '\n';
     }
-    if (text.trim()) text = text.trimEnd() + '\n\nWhich works for you?';
+    if (variationsText.trim()) variationsText = variationsText.trimEnd() + '\n\nWhich works for you?';
   }
 
-  // Return as soft_replace so it only appends if Gemini didn't already have the data
-  // The image was already sent above; this text goes as the follow-up message
-  return { type: text ? 'soft_replace' : 'noop', text: text || '' };
+  // Return product_card — do NOT send image here.
+  // Main flow sends: text first → image after, so customer reads context before image loads.
+  const imageUrl = toUrl(product.image_url || product.imageUrl);
+  return {
+    type: 'product_card',
+    imageUrl: share_media ? imageUrl : null,
+    imageCaption: `${product.name} — ${priceStr}${stockInfo ? ` | ${stockInfo}` : ''}`,
+    variationsText: variationsText || null,
+  };
 }
 
 // ── Show variations ───────────────────────────────────────────────────────────
