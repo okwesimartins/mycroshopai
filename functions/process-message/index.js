@@ -312,22 +312,21 @@ async function processMessage(messageData) {
     }
 
     // ── Persist history BEFORE sending ──────────────────────────────────
-    // CRITICAL: Save both turns to Firestore BEFORE sending the reply to WhatsApp.
-    // If we save after (fire-and-forget), a customer who sends a follow-up message
-    // immediately will read stale history — Gemini loses context and hallucinates.
-    // The extra ~100ms to save is worth correct context on every subsequent message.
-    // Order state and dedup marker are still fire-and-forget (less critical).
+    // Save both turns so follow-up messages always read correct history.
+    // Each individual save catches its own error — Promise.all will never reject.
     await Promise.all([
       typeof firestore.saveMessage === 'function'
         ? firestore.saveMessage(tenantId, customerPhone, 'user',      msgText,    messageId).catch(e => logErr('saveUser', e))
-        : null,
+        : Promise.resolve(),
       typeof firestore.saveMessage === 'function'
         ? firestore.saveMessage(tenantId, customerPhone, 'assistant', finalReply).catch(e => logErr('saveAI', e))
-        : null,
-    ].filter(Boolean));
+        : Promise.resolve(),
+    ]).catch(() => {}); // outer catch — absolutely never let a save failure kill the send
 
     // ── Send to customer ─────────────────────────────────────────────────
-    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, finalReply)
+    // Pass messageId so the reply is tagged to the customer's original message
+    // — they see it quoted in the chat, making context clear
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, finalReply, messageId)
       .catch(e => { logErr('send', e); throw e; });
 
     // ── Remaining writes — fire and forget ───────────────────────────────
@@ -645,7 +644,8 @@ async function handleShowVariations(tenantId, subscriptionPlan, productName, ski
     text += '\n';
   }
   text = text.trimEnd() + '\n\nWhich would you like?';
-  return { type: 'replace', text };
+  // soft_replace — appends to Gemini's intro but doesn't wipe query_inventory's variation text
+  return { type: 'soft_replace', text };
 }
 
 // ── Order creation ────────────────────────────────────────────────────────────
@@ -825,8 +825,16 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
   }
 
   // Price/availability/stock questions
+  // Special case: "how much is the white" / "price of the black one"
+  // The color IS the variation they're asking about — resolve product from history
   if (/\b(price|cost|how much|available|in stock|e dey|do you have|you get)\b/.test(m)) {
-    return { needed: true, search: null };
+    const lastProduct = extractLastProduct(conversationHistory);
+    // If asking about a color/variant with a known product in context, search that product
+    const colorInQuery = message.match(colorWords);
+    if (colorInQuery && lastProduct) {
+      return { needed: true, search: lastProduct, colorHint: colorInQuery[0] };
+    }
+    return { needed: true, search: lastProduct || null };
   }
 
   // Picture requests — use conversation context to find what they mean
