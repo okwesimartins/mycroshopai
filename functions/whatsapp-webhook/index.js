@@ -5,12 +5,17 @@ const { processMessage } = require('../process-message');
 
 /**
  * WhatsApp Webhook Handler
- * Receives webhooks from Meta WhatsApp Business API.
  *
- * For Meta to reach this URL:
- * 1. Cloud Run / Cloud Functions must allow unauthenticated invocations (so Meta can call without IAM).
- * 2. If Meta never hits the URL: check firewall, URL in Meta dashboard, and HTTPS.
- * 3. If you get 401: signature verification failed. Set META_SKIP_SIGNATURE_CHECK=true to test, or ensure raw body is available for verification.
+ * IMPORTANT — Cloud Functions architecture note:
+ * setTimeout/setInterval are NOT reliable here. The Cloud Function process
+ * exits as soon as res.status(200) is sent — any timers scheduled after that
+ * are killed immediately. Do NOT use debounce timers in this file.
+ *
+ * Rapid successive messages (customer sends "Hi" then "I want shoes" quickly):
+ * These arrive as separate webhooks and are handled correctly by the dedup
+ * system in process-message — each message is processed independently.
+ * The conversation history in Firestore gives Gemini full context on each call.
+ * This is the correct architecture for serverless functions.
  */
 
 function setCors(res) {
@@ -23,12 +28,11 @@ functions.http('whatsappWebhook', async (req, res) => {
   setCors(res);
 
   try {
-    // OPTIONS (CORS preflight) – so no policy blocks Meta or proxies
     if (req.method === 'OPTIONS') {
       return res.status(204).end();
     }
 
-    // Handle webhook verification (GET request)
+    // Webhook verification (GET)
     if (req.method === 'GET') {
       const mode = req.query['hub.mode'];
       const token = req.query['hub.verify_token'];
@@ -38,13 +42,11 @@ functions.http('whatsappWebhook', async (req, res) => {
         console.log('Webhook verified');
         return res.status(200).send(challenge);
       }
-
       return res.status(403).send('Forbidden');
     }
 
-    // Handle webhook events (POST request)
+    // Incoming messages (POST)
     if (req.method === 'POST') {
-      // Ensure we have a parsed body first (needed for signature + event detection)
       let payload = req.body;
       if ((!payload || Object.keys(payload).length === 0) && req.rawBody != null) {
         try {
@@ -54,25 +56,22 @@ functions.http('whatsappWebhook', async (req, res) => {
           console.error('[webhook] Failed to parse rawBody as JSON:', e.message);
         }
       }
-      const hasBody = !!(payload && Object.keys(payload).length > 0);
+
       console.log('[webhook] POST received', {
-        hasBody,
+        hasBody: !!(payload && Object.keys(payload).length > 0),
         hasRawBody: !!(req.rawBody != null),
         'x-hub-signature-256': req.headers['x-hub-signature-256'] ? 'present' : 'missing'
       });
 
+      // Signature verification
       const skipSignatureCheck = process.env.META_SKIP_SIGNATURE_CHECK === 'true';
-
       if (!skipSignatureCheck) {
         const rawPayload = req.rawBody != null
           ? (Buffer.isBuffer(req.rawBody) ? req.rawBody.toString('utf8') : String(req.rawBody))
           : null;
 
         if (rawPayload == null) {
-          console.warn(
-            'Webhook signature verification: raw body not available (req.rawBody missing). ' +
-            'Verification may fail. Set META_SKIP_SIGNATURE_CHECK=true to test delivery, or configure your runtime to preserve raw body.'
-          );
+          console.warn('[webhook] raw body not available — signature check may fail. Set META_SKIP_SIGNATURE_CHECK=true to bypass.');
         }
 
         const payloadForVerify = rawPayload != null ? rawPayload : JSON.stringify(payload || {});
@@ -81,84 +80,83 @@ functions.http('whatsappWebhook', async (req, res) => {
           whatsapp.verifyWebhookSignature(signature, payloadForVerify, process.env.META_APP_SECRET);
 
         if (!isValid) {
-          console.error('Invalid webhook signature (check META_APP_SECRET and raw body)');
+          console.error('[webhook] Invalid signature');
           return res.status(401).json({ error: 'Invalid signature' });
         }
       } else {
-        console.warn('Skipping WhatsApp webhook signature verification (META_SKIP_SIGNATURE_CHECK=true)');
+        console.warn('[webhook] Skipping signature verification (META_SKIP_SIGNATURE_CHECK=true)');
       }
 
-      // Detect event type: only process incoming user messages; ignore status (read/delivered/sent) and echoes
-      const entry = payload?.entry?.[0];
-      const change = entry?.changes?.[0];
-      const value = change?.value;
+      // Filter — only process incoming user messages
+      const entry   = payload?.entry?.[0];
+      const change  = entry?.changes?.[0];
+      const value   = change?.value;
       const hasMessages = !!(value?.messages?.length);
-      const hasStatuses = !!(value?.statuses?.length);
-      const hasEchoes = !!(value?.message_echoes?.length);
 
       if (!hasMessages) {
-        if (hasStatuses) {
-          const status = value.statuses[0]?.status || 'unknown';
-          console.log('[webhook] Ignoring status event:', status, '(not an incoming message)');
-        } else if (hasEchoes) {
-          console.log('[webhook] Ignoring message_echo event (outgoing message echo)');
+        if (value?.statuses?.length) {
+          console.log('[webhook] Ignoring status event:', value.statuses[0]?.status);
+        } else if (value?.message_echoes?.length) {
+          console.log('[webhook] Ignoring echo event');
         } else {
-          console.log('[webhook] No message data (no messages in payload). entry:', !!entry, 'change.field:', change?.field);
+          console.log('[webhook] No messages in payload');
         }
         return res.status(200).json({ status: 'ok' });
       }
 
       const messageData = whatsapp.parseWebhook(payload);
       if (!messageData) {
-        console.error('[webhook] parseWebhook returned null despite hasMessages=true. Payload keys:', payload ? Object.keys(payload) : []);
+        console.error('[webhook] parseWebhook returned null');
         return res.status(200).json({ status: 'ok' });
       }
 
-      console.log('[webhook] Incoming message:', { from: messageData.from, text: messageData.text?.substring(0, 100), phoneNumberId: messageData.phoneNumberId });
-
-      // Resolve tenant via backend API (no DB from Cloud)
-      const tenantContext = await backendApi.resolveTenant(messageData.phoneNumberId);
-
-      if (!tenantContext) {
-        console.error('Tenant not found for phone number:', messageData.phoneNumberId);
-        return res.status(200).json({ status: 'ok' }); // Return 200 to prevent retries
-      }
-
-      const {
-        tenant_id,
-        access_token,
-        store_name,
-        business_bio,
-        subscription_plan,
-        default_online_store_id
-      } = tenantContext;
-
-      // Process message asynchronously (API + Firestore only; no DB)
-      processMessage({
-        tenantId: tenant_id,
-        accessToken: access_token,
-        storeName: store_name,
-        businessBio: business_bio,
-        subscriptionPlan: subscription_plan || 'enterprise',
-        defaultOnlineStoreId: default_online_store_id,
-        customerPhone: messageData.from,
-        message: messageData.text,
-        messageId: messageData.messageId,
-        phoneNumberId: messageData.phoneNumberId
-      }).catch(error => {
-        console.error('[webhook] processMessage failed:', error?.message || error);
-        if (error?.stack) console.error('[webhook] processMessage stack:', error.stack);
+      console.log('[webhook] Message:', {
+        from: messageData.from,
+        text: messageData.text?.substring(0, 100),
+        quoted: messageData.quotedMessageId || null,
       });
 
-      // Return 200 immediately to acknowledge receipt
+      // Resolve tenant
+      const tenantContext = await backendApi.resolveTenant(messageData.phoneNumberId);
+      if (!tenantContext) {
+        console.error('[webhook] Tenant not found for phoneNumberId:', messageData.phoneNumberId);
+        return res.status(200).json({ status: 'ok' });
+      }
+
+      const { tenant_id, access_token, store_name, business_bio, subscription_plan, default_online_store_id } = tenantContext;
+
+      // ── Dispatch — fire and forget ────────────────────────────────────────
+      // Return 200 to Meta FIRST, then process. Meta requires acknowledgement
+      // within 20 seconds or it will retry. processMessage can take 2-4 seconds.
+      //
+      // We must call processMessage BEFORE sending the response in Cloud Functions,
+      // because the process exits when res is sent and any pending async work dies.
+      // Solution: await processMessage, THEN send 200.
+      // Meta is fine with responses up to 20s — our processing is well under that.
+      await processMessage({
+        tenantId:            tenant_id,
+        accessToken:         access_token,
+        storeName:           store_name,
+        businessBio:         business_bio,
+        subscriptionPlan:    subscription_plan || 'enterprise',
+        defaultOnlineStoreId: default_online_store_id,
+        customerPhone:       messageData.from,
+        message:             messageData.text,
+        messageId:           messageData.messageId,
+        phoneNumberId:       messageData.phoneNumberId,
+        quotedMessageId:     messageData.quotedMessageId || null,
+      }).catch(error => {
+        console.error('[webhook] processMessage failed:', error?.message || error);
+        if (error?.stack) console.error(error.stack.split('\n').slice(0, 4).join('\n'));
+      });
+
       return res.status(200).json({ status: 'ok' });
     }
 
     return res.status(405).json({ error: 'Method not allowed' });
+
   } catch (error) {
-    console.error('Webhook handler error:', error);
+    console.error('[webhook] Handler error:', error);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
-
-

@@ -132,7 +132,8 @@ async function processMessage(messageData) {
     // KEY RULE: If customer says "can I see a picture" after mentioning a specific product,
     // we fetch ONLY that product — not the whole catalog. Prevents catalog dumping.
     let inventoryText = null;
-    let forcedProductName = null; // set when we know exactly what product to show
+    let prefetchedProducts = null; // cached from pre-fetch — passed to action handlers to avoid double backend calls
+    let forcedProductName = null;
     const inventoryIntent = detectInventoryIntent(msgText, conversationHistory, orderState);
 
     if (inventoryIntent.needed) {
@@ -151,6 +152,7 @@ async function processMessage(messageData) {
             : result.products;
 
           inventoryText = formatProductsForPrompt(products);
+          prefetchedProducts = products; // cache — action handlers will use this, not re-fetch
           if (inventoryIntent.contextual) {
             forcedProductName = products[0]?.name || searchTerm;
           }
@@ -223,7 +225,8 @@ async function processMessage(messageData) {
         tenantId, subscriptionPlan, defaultOnlineStoreId,
         message: msgText, conversationHistory, customerPhone,
         accessToken, phoneNumberId, pendingOrder,
-        aiResponse, // pass full response so handlers can see all actions this turn
+        aiResponse,
+        prefetchedProducts, // avoid re-fetching what was already loaded
       });
 
       if (!result) continue;
@@ -331,7 +334,7 @@ async function handleAction(action, ctx) {
   const { tenantId, subscriptionPlan, defaultOnlineStoreId,
           message, conversationHistory, customerPhone,
           accessToken, phoneNumberId, pendingOrder,
-          aiResponse } = ctx;
+          aiResponse, prefetchedProducts } = ctx;
   try {
     switch (action.type) {
       case 'list_inventory':
@@ -340,6 +343,7 @@ async function handleAction(action, ctx) {
           search:      action.search      ?? null,
           share_media: action.share_media === true,
           accessToken, phoneNumberId, customerPhone, conversationHistory,
+          prefetchedProducts, // use cached data if available
         });
 
       case 'query_inventory':
@@ -347,14 +351,14 @@ async function handleAction(action, ctx) {
           tenantId, subscriptionPlan,
           productName: action.product_name || extractProductName(message),
           intent: action.intent,
-          share_media: action.share_media !== false, // default true for single product queries
+          share_media: action.share_media !== false,
           accessToken, phoneNumberId, customerPhone,
+          prefetchedProducts, // use cached data if available
         });
 
       case 'show_variations': {
         const varProductName = action.product_name || extractLastProduct(conversationHistory);
         // Skip if query_inventory already ran for this same product this turn
-        // (query_inventory includes variations in its response, so this would duplicate)
         const queryRanForSameProduct = (aiResponse?.actions || []).some(a =>
           a.type === 'query_inventory' &&
           (a.product_name || '').toLowerCase() === (varProductName || '').toLowerCase()
@@ -363,6 +367,7 @@ async function handleAction(action, ctx) {
           tenantId, subscriptionPlan,
           varProductName,
           queryRanForSameProduct,
+          prefetchedProducts, // avoid re-fetch
         );
       }
 
@@ -389,23 +394,29 @@ async function handleAction(action, ctx) {
 
 // ── List inventory ────────────────────────────────────────────────────────────
 async function handleListInventory({ tenantId, subscriptionPlan, search, share_media,
-    accessToken, phoneNumberId, customerPhone, conversationHistory }) {
+    accessToken, phoneNumberId, customerPhone, conversationHistory, prefetchedProducts }) {
 
-  const result = await backendApi.listProducts(tenantId, subscriptionPlan, {
-    search: search || undefined,
-    limit:  search ? 12 : 20,
-  });
-
-  if (!result?.products?.length) {
-    return {
-      type: 'replace',
-      text: search
-        ? `We don't have anything matching "${search}" right now. Want to see the full catalog?`
-        : "Catalog's being updated right now. Ask about a specific product and I'll check for you.",
-    };
+  // Use pre-fetched products if available (same search term already loaded before Gemini call)
+  // This avoids a duplicate backend call — saves ~200-500ms
+  let products;
+  if (prefetchedProducts?.length) {
+    products = prefetchedProducts;
+    console.log(`[listInventory] using ${products.length} pre-fetched products (no backend call)`);
+  } else {
+    const result = await backendApi.listProducts(tenantId, subscriptionPlan, {
+      search: search || undefined,
+      limit:  search ? 12 : 20,
+    });
+    if (!result?.products?.length) {
+      return {
+        type: 'replace',
+        text: search
+          ? `We don't have anything matching "${search}" right now. Want to see the full catalog?`
+          : "Catalog's being updated right now. Ask about a specific product and I'll check for you.",
+      };
+    }
+    products = result.products;
   }
-
-  const products  = result.products;
   const base      = (process.env.BACKEND_BASE_URL || process.env.MYCROSHOP_API_URL || 'https://backend.mycroshop.com').replace(/\/$/, '');
   const toUrl     = url => !url ? null : url.startsWith('http') ? url : `${base}${url.startsWith('/')? '':'/'}${url}`;
 
@@ -440,13 +451,9 @@ async function handleListInventory({ tenantId, subscriptionPlan, search, share_m
 
 // ── Query specific product ────────────────────────────────────────────────────
 async function handleQueryInventory({ tenantId, subscriptionPlan, productName, intent,
-    share_media = true, accessToken, phoneNumberId, customerPhone }) {
+    share_media = true, accessToken, phoneNumberId, customerPhone, prefetchedProducts }) {
 
   if (!productName) {
-    // Try to extract from recent conversation before giving up
-    // This handles cases like: AI asked "casual or formal?" → user said "casual" → AI calls
-    // query_inventory with no product_name because it lost context.
-    // In this case, return null so Gemini's own reply is used as-is.
     console.warn('[queryInventory] called with no product_name — skipping action, using Gemini reply');
     return null;
   }
@@ -454,45 +461,54 @@ async function handleQueryInventory({ tenantId, subscriptionPlan, productName, i
   const base  = (process.env.BACKEND_BASE_URL || process.env.MYCROSHOP_API_URL || 'https://backend.mycroshop.com').replace(/\/$/, '');
   const toUrl = url => !url ? null : url.startsWith('http') ? url : `${base}${url.startsWith('/') ? '' : '/'}${url}`;
 
-  // Strategy: try checkProduct first, fall back to listProducts search.
-  // Many backends don't implement checkProduct reliably, but listProducts search always works.
+  // Use pre-fetched products first — find the best match by name
+  // This avoids checkProduct + listProducts calls (saves ~400-800ms)
   let product = null;
+  if (prefetchedProducts?.length) {
+    product = prefetchedProducts.find(p =>
+      p.name?.toLowerCase() === productName.toLowerCase()
+    ) || prefetchedProducts.find(p =>
+      p.name?.toLowerCase().includes(productName.toLowerCase())
+    ) || prefetchedProducts.find(p =>
+      productName.toLowerCase().includes(p.name?.toLowerCase())
+    ) || (prefetchedProducts.length === 1 ? prefetchedProducts[0] : null);
 
-  try {
-    const checkResult = await backendApi.checkProduct(tenantId, productName, subscriptionPlan);
-    if (checkResult?.exists && checkResult.product) {
-      product = checkResult.product;
-      console.log('[queryInventory] checkProduct found:', product.name);
+    if (product) {
+      console.log(`[queryInventory] using pre-fetched product: ${product.name} (no backend call)`);
     }
-  } catch (e) {
-    console.warn('[queryInventory] checkProduct threw error:', e.message, '— trying listProducts fallback');
   }
 
-  // Fallback: search by name if checkProduct failed or returned nothing
+  // Only hit backend if pre-fetch didn't have a match
   if (!product) {
     try {
-      const searchResult = await backendApi.listProducts(tenantId, subscriptionPlan, {
-        search: productName, limit: 5
-      });
+      const checkResult = await backendApi.checkProduct(tenantId, productName, subscriptionPlan);
+      if (checkResult?.exists && checkResult.product) {
+        product = checkResult.product;
+      }
+    } catch (e) {
+      console.warn('[queryInventory] checkProduct error:', e.message);
+    }
+  }
+
+  if (!product) {
+    try {
+      const searchResult = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 5 });
       if (searchResult?.products?.length) {
-        // Find best match — exact name first, then partial
         product = searchResult.products.find(p =>
           p.name?.toLowerCase() === productName.toLowerCase()
         ) || searchResult.products.find(p =>
           p.name?.toLowerCase().includes(productName.toLowerCase())
         ) || searchResult.products[0];
-        console.log('[queryInventory] listProducts fallback found:', product?.name);
       }
     } catch (e) {
-      console.error('[queryInventory] listProducts fallback also failed:', e.message);
+      console.error('[queryInventory] listProducts fallback failed:', e.message);
     }
   }
 
   if (!product) {
-    // Try even broader search before giving up
     try {
       const broad = await backendApi.listProducts(tenantId, subscriptionPlan, {
-        search: productName.split(' ')[0], limit: 5 // search just first word
+        search: productName.split(' ')[0], limit: 5
       });
       if (broad?.products?.length) {
         let text = `Couldn't find "${productName}" exactly. Did you mean:\n\n`;
@@ -570,18 +586,24 @@ async function handleQueryInventory({ tenantId, subscriptionPlan, productName, i
 }
 
 // ── Show variations ───────────────────────────────────────────────────────────
-async function handleShowVariations(tenantId, subscriptionPlan, productName, skipIfAlreadyInReply = false) {
+async function handleShowVariations(tenantId, subscriptionPlan, productName, skipIfAlreadyInReply = false, prefetchedProducts = null) {
   if (!productName) return null;
-  // If called alongside query_inventory on same product, query_inventory already includes variations
   if (skipIfAlreadyInReply) return null;
 
-  const result = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 5 })
-    .catch(e => { console.error('[showVariations] listProducts error:', e.message); return null; });
+  // Use pre-fetched product if available
+  let p = null;
+  if (prefetchedProducts?.length) {
+    p = prefetchedProducts.find(x => x.name?.toLowerCase().includes(productName.toLowerCase()))
+      || prefetchedProducts[0];
+  }
 
-  if (!result?.products?.length) return null;
-
-  const p = result.products.find(x => x.name?.toLowerCase().includes(productName.toLowerCase()))
-         || result.products[0];
+  if (!p) {
+    const result = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 5 })
+      .catch(e => { console.error('[showVariations] listProducts error:', e.message); return null; });
+    if (!result?.products?.length) return null;
+    p = result.products.find(x => x.name?.toLowerCase().includes(productName.toLowerCase()))
+      || result.products[0];
+  }
 
   if (!p.variations?.length) {
     // No variations — product detail already sent by query_inventory, nothing to add
