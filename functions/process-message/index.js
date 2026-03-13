@@ -95,6 +95,10 @@ async function processMessage(messageData) {
 
     if (isDuplicate) { log('dedup', 'already processed, skipping'); return; }
 
+    // Mark message as read immediately — shows blue ticks to customer
+    // Fire-and-forget: never block processing for this
+    whatsapp.markAsRead(phoneNumberId, accessToken, messageId).catch(() => {});
+
     // Contact limit — only matters for brand new customers (first message ever)
     const isNewCustomer = rawHistory.length === 0;
     if (isNewCustomer && typeof firestore.checkContactLimit === 'function') {
@@ -173,6 +177,13 @@ async function processMessage(messageData) {
       inventoryMeta = `INSTRUCTION: Customer is asking to see a picture of "${forcedProductName}" based on earlier conversation. Emit query_inventory with product_name="${forcedProductName}" and share_media:true. Do NOT use list_inventory. Do NOT send the whole catalog.`;
     } else if (inventoryIntent.colorHint) {
       inventoryMeta = `CONTEXT: Customer wants "${inventoryIntent.colorHint}" color/variant. Check the product variations for this color option and highlight it in your reply. If found, mention it specifically. If not found, suggest the closest available colors.`;
+    }
+
+    // If customer explicitly asked for variations in the same message (e.g. "show me sneakers and the variations"),
+    // tell Gemini to always emit show_variations — don't leave it to chance
+    if (inventoryIntent.wantsVariations && inventoryIntent.search) {
+      const varNote = `\nINSTRUCTION: Customer also explicitly asked to see the variations/options. Always emit show_variations action for ${inventoryIntent.search} in your response.`;
+      inventoryMeta = (inventoryMeta || '') + varNote;
     }
 
     // Resolve quoted message — when customer replies to a specific message ("I want this")
@@ -271,7 +282,10 @@ async function processMessage(messageData) {
       .replace(/ {2,}/g, ' ')
       .trim();
 
-    if (!finalReply) finalReply = 'Something went wrong on my end. Try again in a moment.';
+    // If Gemini returned empty reply (JSON parse failed and no rescue), use a safe default
+    if (!finalReply || !finalReply.trim()) {
+      finalReply = 'Give me a sec on that.';
+    }
 
     // ── Final JSON leak guard ────────────────────────────────────────────
     // Last-resort safety: if finalReply is still a JSON object string, extract the reply field.
@@ -297,20 +311,28 @@ async function processMessage(messageData) {
       }
     }
 
-    // ── Send to customer ─────────────────────────────────────────────────
-    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, finalReply)
-      .catch(e => { logErr('send', e); throw e; });
-
-    // ── Persist — fire and forget ────────────────────────────────────────
-    // Customer already got their reply. Run all writes in parallel, in background.
-    // Failures are logged but don't affect the customer or slow down the response.
-    Promise.all([
+    // ── Persist history BEFORE sending ──────────────────────────────────
+    // CRITICAL: Save both turns to Firestore BEFORE sending the reply to WhatsApp.
+    // If we save after (fire-and-forget), a customer who sends a follow-up message
+    // immediately will read stale history — Gemini loses context and hallucinates.
+    // The extra ~100ms to save is worth correct context on every subsequent message.
+    // Order state and dedup marker are still fire-and-forget (less critical).
+    await Promise.all([
       typeof firestore.saveMessage === 'function'
         ? firestore.saveMessage(tenantId, customerPhone, 'user',      msgText,    messageId).catch(e => logErr('saveUser', e))
         : null,
       typeof firestore.saveMessage === 'function'
         ? firestore.saveMessage(tenantId, customerPhone, 'assistant', finalReply).catch(e => logErr('saveAI', e))
         : null,
+    ].filter(Boolean));
+
+    // ── Send to customer ─────────────────────────────────────────────────
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, finalReply)
+      .catch(e => { logErr('send', e); throw e; });
+
+    // ── Remaining writes — fire and forget ───────────────────────────────
+    // Order state and dedup are less time-sensitive — fine to write in background.
+    Promise.all([
       typeof firestore.saveOrderState === 'function'
         ? firestore.saveOrderState(tenantId, customerPhone, { state: newOrderState, pending_order: newPending }).catch(() => {})
         : null,
@@ -765,27 +787,39 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
   // "blue Air Force 1" → search "Air Force 1", note color=blue
   const colorWords = /\b(red|blue|green|black|white|grey|gray|ash|brown|pink|yellow|purple|orange|nude|beige|navy|cream|gold|silver|maroon|cyan|teal|olive|coral|mint|lavender|charcoal|khaki|tan|multicolor|multi)\b/gi;
 
+  // Words that TERMINATE the product name — everything after these is not the product
+  // e.g. "sneakers AND the variations" → stop at "and", searchTerm = "sneakers"
+  const stopWords = /^(and|with|or|but|for|variations?|options?|sizes?|colors?|colours?|pictures?|photos?|images?|please|thanks?)$/i;
+  // Words to skip entirely (articles, possessives that appear inside the product phrase)
+  const skipTerms = /^(me|your|the|a|an|any|some|picture|photo|image|catalog|products|items|stuff|price|prices|touch|of|in|type|kind|style|color|colour|colors|colours)$/i;
+
   const specificPatterns = [
-    /(?:show me|you have|do you have|got any|any|see|find|need|want|looking for)\s+(?:the\s+|some\s+|a\s+)?([a-z][a-z0-9 ]{1,40}?)(?:\?|$|\.|please|,)/i,
+    /(?:can i see|show me|you have|do you have|got any|any|see|find|need|want|looking for)\s+(?:the\s+|some\s+|a\s+|your\s+)?([a-z][a-z0-9 ]{1,40}?)(?:\?|$|\.|please|,|\band\b)/i,
     /(?:how much is|price of|cost of|how much for)\s+(?:the\s+)?([a-z][a-z0-9 ]{1,40}?)(?:\?|$|\.)/i,
     /(?:picture|photo|image)s?\s+(?:of\s+)?(?:the\s+)?([a-z][a-z0-9 ]{1,40}?)(?:\?|$|\.)/i,
     /(?:i need|i want)\s+(?:the\s+|some\s+|a\s+)?([a-z][a-z0-9 ]{1,40}?)(?:\?|$|\.|,|please)/i,
   ];
-  const skipTerms = /^(me|your|the|a|an|any|some|picture|photo|image|catalog|products|items|stuff|price|prices|touch|of|with|in|and|type|kind|style|color|colour|colors|colours)$/i;
 
   for (const p of specificPatterns) {
     const match = message.match(p);
     if (match?.[1]) {
-      // Strip color words and noise from the search term — they confuse the backend search
       const raw = match[1].trim();
-      const cleaned = raw.replace(colorWords, '').replace(/\s{2,}/g, ' ').trim();
-      const searchTerm = cleaned.split(' ').filter(w => !skipTerms.test(w)).join(' ').trim();
+      // Strip color words first
+      const decolored = raw.replace(colorWords, '').replace(/\s{2,}/g, ' ').trim();
+      // Walk word by word — stop at the first stop word so "variations" never joins the search
+      const words = [];
+      for (const w of decolored.split(' ')) {
+        if (stopWords.test(w)) break;
+        if (!skipTerms.test(w)) words.push(w);
+      }
+      const searchTerm = words.join(' ').trim();
 
       if (searchTerm && searchTerm.length > 1) {
-        // Capture color mentions to pass as context
         const colorMatches = raw.match(colorWords);
         const colorHint = colorMatches ? colorMatches.join(', ') : null;
-        return { needed: true, search: searchTerm, colorHint };
+        // Flag if the message also explicitly asked for variations
+        const wantsVariations = /\b(variation|option|size|color|colour)s?\b/i.test(message);
+        return { needed: true, search: searchTerm, colorHint, wantsVariations };
       }
     }
   }
@@ -843,7 +877,9 @@ function fmtN(amount) {
 
 /** Is this reply a placeholder that should be replaced by real data? */
 function isPlaceholder(text) {
-  return /^(on it|sure|ok|checking|let me|pulling|one sec|hold on|gimme|alright|yeah)/i.test((text || '').trim());
+  const t = (text || '').trim();
+  if (!t) return true; // empty = definitely a placeholder
+  return /^(on it|sure|ok|checking|let me|pulling|one sec|hold on|gimme|alright|yeah|give me a sec|let me pull|hang on|just a)/i.test(t);
 }
 
 /**
