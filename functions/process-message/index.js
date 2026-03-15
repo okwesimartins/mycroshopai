@@ -771,6 +771,14 @@ async function handleAction(action, ctx) {
     }
   } catch (err) {
     console.error('[handleAction] error in', action.type, err?.message);
+    // For order creation failures, tell the customer explicitly — don't silently eat the error
+    // while showing them "payment details will follow" from Gemini's reply
+    if (action.type === 'create_order') {
+      return {
+        type: 'replace',
+        text: "There was an issue placing your order. Please try again in a moment or contact the store directly.",
+      };
+    }
     return null;
   }
 }
