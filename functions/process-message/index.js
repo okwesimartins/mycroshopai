@@ -1114,17 +1114,45 @@ async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineSt
   }
 
   // Validate each item and resolve product_id + variant_id
+  // Strategy: try checkProduct first. If it fails (server error), fall back to
+  // listProducts search. Never block an order due to a backend endpoint failure.
   const validItems = [];
   for (const item of details.items) {
-    const check = await backendApi.checkProduct(tenantId, item.product_name, subscriptionPlan);
-    if (!check?.exists || !check.product) {
+    let p = null;
+
+    // Attempt 1: checkProduct (may fail if plan is 'free' or endpoint is down)
+    const check = await backendApi.checkProduct(tenantId, item.product_name, subscriptionPlan)
+      .catch(() => null);
+
+    if (check?.exists && check.product) {
+      p = check.product;
+    } else if (!check || !check.success) {
+      // checkProduct failed (server error) — fall back to listProducts search
+      console.warn(`[order] checkProduct failed for "${item.product_name}" — trying listProducts fallback`);
+      const fallback = await backendApi.listProducts(tenantId, subscriptionPlan, {
+        search: item.product_name, limit: 5,
+      }).catch(() => null);
+
+      if (fallback?.products?.length) {
+        p = fallback.products.find(x =>
+          x.name?.toLowerCase() === item.product_name.toLowerCase()
+        ) || fallback.products.find(x =>
+          x.name?.toLowerCase().includes(item.product_name.toLowerCase())
+        ) || fallback.products[0];
+      }
+    }
+    // check returned success:false (product genuinely not found)
+    // p remains null → inform customer
+
+    if (!p) {
       return { type: 'replace', text: `"${item.product_name}" isn't available right now. Want to see what we have?` };
     }
-    const p = check.product;
+
     const qty = item.quantity || 1;
     if (p.stock != null && p.stock < qty) {
       return { type: 'replace', text: `We only have ${p.stock} of the ${p.name} left — you wanted ${qty}. Want to adjust?` };
     }
+
     // Resolve variant_id from SKU combos if customer specified one
     let resolvedVariantId = item.variant_id || null;
     if (!resolvedVariantId && item.option_requested && p.variants?.length) {
