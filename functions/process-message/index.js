@@ -333,7 +333,11 @@ async function processMessage(messageData) {
         message: msgText, conversationHistory, customerPhone,
         accessToken, phoneNumberId, pendingOrder,
         aiResponse,
-        prefetchedProducts, // avoid re-fetching what was already loaded
+        prefetchedProducts,
+        // Payment config — needed by handleOrderCreation
+        paymentInstructionType, paypalEmail,
+        bankAccountName, bankName, bankAccountNumber, bankCode,
+        paymentInstructions,
       });
 
       if (!result) continue;
@@ -345,9 +349,11 @@ async function processMessage(messageData) {
 
       } else if (result.type === 'replace') {
         finalReply = result.text || finalReply;
-        // handleOrderCreation signals the new order state directly on the result
         if (result.new_order_state)   newOrderState = result.new_order_state;
         if (result.new_pending_order) newPending    = result.new_pending_order;
+        // Order confirmation is the final word — stop processing other actions.
+        // Prevents Gemini's co-emitted list_inventory from dumping random product images.
+        if (result.new_order_state === 'awaiting_payment') break;
 
       } else if (result.type === 'soft_replace') {
         // Soft replace — only overwrite if Gemini wrote a placeholder, not a real answer
@@ -396,6 +402,11 @@ async function processMessage(messageData) {
       .replace(/\b(list_inventory|query_inventory|create_order|check_payment|show_variations)\b/gi, '')
       .replace(/\n{3,}/g, '\n\n')
       .replace(/ {2,}/g, ' ')
+      // Remove exclamation marks — they read as robotic/bot-like, not human
+      // Exception: emoji sequences and order confirmations (✅) are fine
+      // Replace "word!" with "word." and "word! " with "word. " naturally
+      .replace(/([a-zA-Z0-9])!(?=[^!]|$)/g, (_, c) => c + '.')
+      .replace(/\.{2,}/g, '.')   // "word.." → "word."
       .trim();
 
     // If Gemini returned empty reply (JSON parse failed and no rescue), use a safe default
@@ -699,7 +710,10 @@ async function handleAction(action, ctx) {
   const { tenantId, subscriptionPlan, defaultOnlineStoreId,
           message, conversationHistory, customerPhone,
           accessToken, phoneNumberId, pendingOrder,
-          aiResponse, prefetchedProducts } = ctx;
+          aiResponse, prefetchedProducts,
+          paymentInstructionType, paypalEmail,
+          bankAccountName, bankName, bankAccountNumber, bankCode,
+          paymentInstructions } = ctx;
   try {
     switch (action.type) {
       case 'list_inventory':
