@@ -123,7 +123,11 @@ functions.http('whatsappWebhook', async (req, res) => {
         return res.status(200).json({ status: 'ok' });
       }
 
-      const { tenant_id, access_token, store_name, business_bio, subscription_plan, default_online_store_id } = tenantContext;
+      const {
+        tenant_id, access_token, store_name, business_bio, subscription_plan, default_online_store_id,
+        payment_instruction_type, paypal_email, bank_account_name, bank_name,
+        bank_account_number, bank_code, payment_instructions, owner_whatsapp_number,
+      } = tenantContext;
 
       // ── Dispatch — fire and forget ────────────────────────────────────────
       // Return 200 to Meta FIRST, then process. Meta requires acknowledgement
@@ -134,17 +138,29 @@ functions.http('whatsappWebhook', async (req, res) => {
       // Solution: await processMessage, THEN send 200.
       // Meta is fine with responses up to 20s — our processing is well under that.
       await processMessage({
-        tenantId:            tenant_id,
-        accessToken:         access_token,
-        storeName:           store_name,
-        businessBio:         business_bio,
-        subscriptionPlan:    subscription_plan || 'enterprise',
+        tenantId:             tenant_id,
+        accessToken:          access_token,
+        storeName:            store_name,
+        businessBio:          business_bio,
+        subscriptionPlan:     subscription_plan || 'enterprise',
         defaultOnlineStoreId: default_online_store_id,
-        customerPhone:       messageData.from,
-        message:             messageData.text,
-        messageId:           messageData.messageId,
-        phoneNumberId:       messageData.phoneNumberId,
-        quotedMessageId:     messageData.quotedMessageId || null,
+        // Payment config
+        paymentInstructionType: payment_instruction_type || null,
+        paypalEmail:            paypal_email            || null,
+        bankAccountName:        bank_account_name       || null,
+        bankName:               bank_name               || null,
+        bankAccountNumber:      bank_account_number     || null,
+        bankCode:               bank_code               || null,
+        paymentInstructions:    payment_instructions    || null,
+        ownerWhatsappNumber:    owner_whatsapp_number   || null,
+        // Message data
+        customerPhone:        messageData.from,
+        message:              messageData.text,
+        messageId:            messageData.messageId,
+        phoneNumberId:        messageData.phoneNumberId,
+        quotedMessageId:      messageData.quotedMessageId || null,
+        incomingImage:        messageData.incomingImage   || null,
+        buttonReply:          messageData.buttonReply     || null, // store owner approve/decline
       }).catch(error => {
         console.error('[webhook] processMessage failed:', error?.message || error);
         if (error?.stack) console.error(error.stack.split('\n').slice(0, 4).join('\n'));
