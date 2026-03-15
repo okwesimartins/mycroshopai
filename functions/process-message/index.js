@@ -1078,10 +1078,12 @@ async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineSt
   if (orderDataFromGemini?.product_name) {
     details = {
       items: [{
-        product_name: orderDataFromGemini.product_name,
-        product_id:   orderDataFromGemini.product_id   || null,
-        variant_id:   orderDataFromGemini.variant_id   || null,
-        quantity:     orderDataFromGemini.quantity      || 1,
+        product_name:     orderDataFromGemini.product_name,
+        product_id:       orderDataFromGemini.product_id      || null,
+        variant_id:       orderDataFromGemini.variant_id      || null,
+        // selected_options: Gemini passes "Black / 42" so we can resolve the correct variant
+        selected_options: orderDataFromGemini.selected_options || null,
+        quantity:         orderDataFromGemini.quantity         || 1,
       }],
       customer_name:    orderDataFromGemini.customer_name    || null,
       customer_phone:   orderDataFromGemini.customer_phone   || customerPhone,
@@ -1153,25 +1155,79 @@ async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineSt
       return { type: 'replace', text: `We only have ${p.stock} of the ${p.name} left — you wanted ${qty}. Want to adjust?` };
     }
 
-    // Resolve variant_id from SKU combos if customer specified one
+    // Resolve variant_id — try multiple sources in priority order:
+    // 1. Explicit variant_id from Gemini (rare but possible)
+    // 2. selected_options string "Black / 42" — match against variant combos
+    // 3. item.option_requested (from query_inventory context)
     let resolvedVariantId = item.variant_id || null;
-    if (!resolvedVariantId && item.option_requested && p.variants?.length) {
-      const matched = p.variants.find(v =>
-        v.options?.some(o =>
-          (o.option_display_name || o.option_value)?.toLowerCase() === item.option_requested?.toLowerCase()
-        )
-      );
-      if (matched) resolvedVariantId = matched.id;
+
+    if (!resolvedVariantId && p.variants?.length) {
+      const needle = (item.selected_options || item.option_requested || '').toLowerCase().trim();
+
+      if (needle) {
+        // Parse "Black / 42" into individual tokens and find the variant that matches ALL of them
+        const tokens = needle.split(/[\s/,+]+/).map(t => t.trim()).filter(Boolean);
+
+        resolvedVariantId = p.variants.find(v =>
+          tokens.every(token =>
+            v.options?.some(o =>
+              (o.option_display_name || o.option_value || '').toLowerCase().includes(token)
+            )
+          )
+        )?.id || null;
+
+        // Fallback: match any single token (e.g. just "Black" without size)
+        if (!resolvedVariantId) {
+          resolvedVariantId = p.variants.find(v =>
+            tokens.some(token =>
+              v.options?.some(o =>
+                (o.option_display_name || o.option_value || '').toLowerCase() === token
+              )
+            )
+          )?.id || null;
+        }
+      }
     }
-    const unitPrice = resolvedVariantId
-      ? (p.variants?.find(v => v.id === resolvedVariantId)?.price ?? p.price)
-      : p.price;
+
+    // Resolve unit price — must never be 0 or null
+    // Priority: matched variant price → cheapest variant price → variation min price → product base price
+    let unitPrice = null;
+
+    if (resolvedVariantId) {
+      unitPrice = p.variants?.find(v => v.id === resolvedVariantId)?.price ?? null;
+    }
+
+    if (!unitPrice || parseFloat(unitPrice) <= 0) {
+      if (p.variants?.length) {
+        // Product is variant-only (p.price is null) — use cheapest variant
+        const prices = p.variants.map(v => parseFloat(v.price)).filter(n => !isNaN(n) && n > 0);
+        unitPrice = prices.length ? Math.min(...prices) : null;
+      } else if (p.variations?.length) {
+        // Variations with price_adjustment — find minimum
+        let min = null;
+        for (const v of p.variations) {
+          for (const o of (v.options || [])) {
+            const n = parseFloat(o.price_adjustment || o.price);
+            if (!isNaN(n) && n > 0 && (min === null || n < min)) min = n;
+          }
+        }
+        unitPrice = min;
+      } else {
+        unitPrice = p.price;
+      }
+    }
+
+    const finalUnitPrice = parseFloat(unitPrice);
+    if (!finalUnitPrice || finalUnitPrice <= 0) {
+      console.error(`[order] Could not resolve price for ${p.name} (variant=${resolvedVariantId})`);
+      return { type: 'replace', text: `There was an issue with the price for ${p.name}. Please contact the store directly.` };
+    }
     validItems.push({
-      product_id: p.id,
-      variant_id: resolvedVariantId,
+      product_id:   p.id,
+      variant_id:   resolvedVariantId,
       product_name: p.name,
-      quantity: qty,
-      price: parseFloat(unitPrice) || 0,
+      quantity:     qty,
+      price:        finalUnitPrice,
     });
   }
 
