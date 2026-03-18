@@ -338,6 +338,8 @@ async function processMessage(messageData) {
         paymentInstructionType, paypalEmail,
         bankAccountName, bankName, bankAccountNumber, bankCode,
         paymentInstructions,
+        // For idempotency: use inbound WhatsApp messageId as key
+        messageId,
       });
 
       if (!result) continue;
@@ -713,7 +715,8 @@ async function handleAction(action, ctx) {
           aiResponse, prefetchedProducts,
           paymentInstructionType, paypalEmail,
           bankAccountName, bankName, bankAccountNumber, bankCode,
-          paymentInstructions } = ctx;
+          paymentInstructions,
+          messageId } = ctx;
   try {
     switch (action.type) {
       case 'list_inventory':
@@ -760,6 +763,7 @@ async function handleAction(action, ctx) {
           paymentInstructionType, paypalEmail,
           bankAccountName, bankName, bankAccountNumber, bankCode,
           paymentInstructions,
+          messageId,
         });
 
       case 'check_payment':
@@ -1075,7 +1079,7 @@ async function handleShowVariations(tenantId, subscriptionPlan, productName, ski
 async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineStoreId,
     message, conversationHistory, customerPhone, orderDataFromGemini, pendingOrder,
     paymentInstructionType, paypalEmail, bankAccountName, bankName,
-    bankAccountNumber, bankCode, paymentInstructions }) {
+    bankAccountNumber, bankCode, paymentInstructions, messageId }) {
 
   if (!defaultOnlineStoreId) {
     return { type: 'replace', text: "This store isn't set up for online orders yet. Reach out to the merchant directly." };
@@ -1239,7 +1243,7 @@ async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineSt
     });
   }
 
-  // Create the order
+  // Create the order (idempotent) — use inbound WhatsApp messageId as idempotency key
   const orderResult = await backendApi.createOrder(tenantId, {
     online_store_id: defaultOnlineStoreId,
     items: validItems,
@@ -1249,6 +1253,7 @@ async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineSt
       phone:            details.customer_phone   || customerPhone,
       shipping_address: details.shipping_address || '',
     },
+    idempotency_key: messageId || undefined,
   });
 
   if (!orderResult.success) {
