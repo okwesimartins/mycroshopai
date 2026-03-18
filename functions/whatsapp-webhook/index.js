@@ -161,6 +161,7 @@ functions.http('whatsappWebhook', async (req, res) => {
         quotedMessageId:      messageData.quotedMessageId || null,
         incomingImage:        messageData.incomingImage   || null,
         buttonReply:          messageData.buttonReply     || null, // store owner approve/decline
+        listReply:            messageData.listReply       || null, // user selected from list (e.g. time slot)
       }).catch(error => {
         console.error('[webhook] processMessage failed:', error?.message || error);
         if (error?.stack) console.error(error.stack.split('\n').slice(0, 4).join('\n'));

@@ -55,6 +55,7 @@ async function processMessage(messageData) {
     quotedMessageId = null,
     incomingImage   = null,
     buttonReply     = null,   // store owner tapped Approve/Decline button
+    listReply       = null,   // user selected from list (e.g. time slot: id = slot_<serviceId>_<date>_<time>)
     // Payment configuration from merchant's store settings
     paymentInstructionType = null,
     paypalEmail            = null,
@@ -122,6 +123,16 @@ async function processMessage(messageData) {
       return;
     }
 
+    // ── Booking: user selected a time slot from interactive list ─────────
+    // listReply.id format: slot_<serviceId>_<date>_<time> e.g. slot_5_2025-03-09_09:00
+    if (listReply?.id && String(listReply.id).startsWith('slot_')) {
+      await handleBookingSlotSelection({
+        listReply, tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken,
+        storeName: storeNameResolved,
+      });
+      return;
+    }
+
     // Download incoming image — could be a receipt OR a product screenshot
     // Decision is made AFTER we know the order state
     let incomingImageData = null;
@@ -141,8 +152,8 @@ async function processMessage(messageData) {
       if (limit.reached) {
         await safeSend(phoneNumberId, customerPhone, accessToken,
           `Sorry, this store has reached its contact limit. Please reach out to the merchant directly.`);
-        return;
-      }
+      return;
+    }
     }
 
     // Track contact — fire-and-forget, never block the main flow
@@ -171,9 +182,9 @@ async function processMessage(messageData) {
       await safeSend(phoneNumberId, customerPhone, accessToken,
         `Your receipt for Order ${orderNum} has been received and is being reviewed by the store. ` +
         `You'll get a notification here as soon as it's confirmed. Thank you for your patience! 🙏`
-      );
-      return;
-    }
+          );
+          return;
+        }
 
     // ── Receipt intercept ────────────────────────────────────────────────
     // Fires when customer sends an image that is a payment receipt.
@@ -313,6 +324,7 @@ async function processMessage(messageData) {
     let newOrderState = aiResponse.order_state || orderState;
     let newPending    = pendingOrder;
     let pendingImages = []; // images to send AFTER the text reply
+    let pendingSlotList = null; // interactive list of time slots for booking
 
     // Safety net: if Gemini emits list_inventory with share_media for a contextual picture request,
     // convert it to query_inventory for the specific product so we don't dump the whole catalog
@@ -394,6 +406,9 @@ async function processMessage(messageData) {
           pendingImages.push(...result.images);
         }
 
+      } else if (result.type === 'send_slot_list') {
+        // Booking: show time slots as interactive list (tap to select)
+        pendingSlotList = result;
       } else if (result.type === 'noop') {
         // Action completed (e.g. images sent) but no text change needed — leave finalReply as-is
       }
@@ -401,7 +416,7 @@ async function processMessage(messageData) {
 
     // ── Final cleanup ────────────────────────────────────────────────────
     finalReply = (finalReply || '')
-      .replace(/\b(list_inventory|query_inventory|create_order|check_payment|show_variations)\b/gi, '')
+      .replace(/\b(list_inventory|query_inventory|create_order|check_payment|show_variations|list_services|get_availability|book_service)\b/gi, '')
       .replace(/\n{3,}/g, '\n\n')
       .replace(/ {2,}/g, ' ')
       // Remove exclamation marks — they read as robotic/bot-like, not human
@@ -476,6 +491,16 @@ async function processMessage(messageData) {
       ));
     }
 
+    // BOOKING: send interactive list of time slots (user taps to confirm slot)
+    if (pendingSlotList?.sections?.length) {
+      whatsapp.sendInteractiveList(
+        phoneNumberId, accessToken, customerPhone,
+        pendingSlotList.bodyText || 'Pick a time slot:',
+        pendingSlotList.buttonText || 'Pick a time',
+        pendingSlotList.sections
+      ).catch(e => logErr('sendSlotList', e));
+    }
+
     // ── Remaining writes — fire and forget ───────────────────────────────
     // Order state and dedup are less time-sensitive — fine to write in background.
     Promise.all([
@@ -487,7 +512,7 @@ async function processMessage(messageData) {
         : null,
     ].filter(Boolean)).catch(() => {});
 
-  } catch (err) {
+      } catch (err) {
     logErr('FATAL', err);
     await safeSend(phoneNumberId, customerPhone, accessToken,
       'Sorry, something went wrong. Try again in a moment.').catch(() => {});
@@ -704,6 +729,45 @@ async function handleOwnerButtonReply({ buttonReply, tenantId, phoneNumberId, ac
   log('done', `Customer notified, state → ${newState}`);
 }
 
+// ── Booking: user tapped a time slot from the interactive list ─────────────────
+// listReply.id = "slot_<serviceId>_<date>_<time>" e.g. slot_5_2025-03-09_09:00
+async function handleBookingSlotSelection({
+  listReply, tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken, storeName
+}) {
+  const log = (tag, ...a) => console.log(`[booking-slot:${tag}]`, ...a);
+  const parts = String(listReply.id || '').split('_');
+  if (parts.length < 4 || parts[0] !== 'slot') {
+    log('skip', 'invalid slot id:', listReply.id);
+    return;
+  }
+  const serviceId = parseInt(parts[1], 10);
+  const dateStr = parts[2];
+  const timeStr = parts[3];
+  if (!serviceId || !dateStr || !timeStr) {
+    log('skip', 'missing service/date/time');
+    return;
+  }
+  const scheduledAt = `${dateStr}T${timeStr.length === 5 ? timeStr : timeStr + ':00'}:00`;
+  try {
+    await backendApi.createBooking(tenantId, {
+      service_id: serviceId,
+      scheduled_at: scheduledAt,
+      customer_name: 'WhatsApp Customer',
+      customer_phone: customerPhone,
+      subscription_plan: subscriptionPlan
+    });
+    const timeLabel = (listReply.title && /[\d:]+/.test(listReply.title)) ? listReply.title : timeStr;
+    const msg = `You're all set. Your appointment is confirmed for ${dateStr} at ${timeLabel}. We'll see you then.`;
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, msg, null);
+    log('done', `Booking created for ${scheduledAt}`);
+  } catch (e) {
+    console.error('[booking-slot] createBooking failed:', e.message);
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone,
+      "We couldn't complete the booking right now. Please try again or contact the store directly.", null
+    ).catch(() => {});
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Action Handlers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -719,6 +783,29 @@ async function handleAction(action, ctx) {
           messageId } = ctx;
   try {
     switch (action.type) {
+      case 'list_services':
+        return await handleListServices({
+          tenantId, subscriptionPlan, defaultOnlineStoreId,
+        });
+
+      case 'get_availability':
+        return await handleGetAvailability({
+          tenantId, subscriptionPlan,
+          service_id: action.service_id,
+          date: action.date,
+          service_title: action.service_title,
+        });
+
+      case 'book_service':
+        return await handleBookService({
+          tenantId, subscriptionPlan, customerPhone,
+          service_id: action.service_id,
+          scheduled_at: action.scheduled_at,
+          customer_name: action.customer_name,
+          customer_phone: action.customer_phone || customerPhone,
+          customer_email: action.customer_email,
+        });
+
       case 'list_inventory':
         return await handleListInventory({
           tenantId, subscriptionPlan,
@@ -836,11 +923,81 @@ async function handleListInventory({ tenantId, subscriptionPlan, search, share_m
   return { type: 'data', text: text.trim() };
 }
 
+// ── Booking: list services ────────────────────────────────────────────────────
+async function handleListServices({ tenantId, subscriptionPlan, defaultOnlineStoreId }) {
+  const result = await backendApi.listServices(tenantId, subscriptionPlan, {
+    ...(defaultOnlineStoreId ? { online_store_id: defaultOnlineStoreId } : {})
+  });
+  if (!result?.services?.length) {
+    return { type: 'replace', text: "We don't have any bookable services at the moment. Ask again later or contact the store." };
+  }
+  const lines = result.services.map((s, i) => {
+    const price = s.price ? `₦${Number(s.price).toLocaleString()}` : 'Price on request';
+    return `${i + 1}. ${s.service_title} – ${s.duration_minutes || 30} min, ${price}`;
+  });
+  const text = `Here are our services:\n\n${lines.join('\n')}\n\nWhich one would you like to book, and for which date?`;
+  return { type: 'data', text };
+}
+
+// ── Booking: get availability and return interactive slot list ──────────────────
+async function handleGetAvailability({ tenantId, subscriptionPlan, service_id, date, service_title }) {
+  if (!service_id || !date) return null;
+  const result = await backendApi.getServiceAvailability(tenantId, service_id, date, subscriptionPlan);
+  if (!result?.slots?.length) {
+    return {
+      type: 'replace',
+      text: `No available slots for ${service_title || 'this service'} on ${date}. Pick another date?`,
+    };
+  }
+  const rows = result.slots.slice(0, 10).map(s => ({
+    id: `slot_${service_id}_${date}_${s.slot}`,
+    title: s.label,
+  }));
+  return {
+    type: 'send_slot_list',
+    bodyText: `Pick a time for ${service_title || 'your appointment'} on ${date}:`,
+    buttonText: 'Pick a time',
+    sections: [{ title: 'Available times', rows }],
+  };
+}
+
+// ── Booking: create booking (when Gemini has all details) ──────────────────────
+async function handleBookService({
+  tenantId, subscriptionPlan, customerPhone,
+  service_id, scheduled_at, customer_name, customer_phone, customer_email,
+}) {
+  if (!service_id || !scheduled_at || !customer_name || !customer_phone) return null;
+  try {
+    const data = await backendApi.createBooking(tenantId, {
+      service_id,
+      scheduled_at,
+      customer_name,
+      customer_phone,
+      customer_email,
+      subscription_plan: subscriptionPlan,
+    });
+    const b = data?.data?.booking;
+    const at = b?.scheduled_at ? new Date(b.scheduled_at) : null;
+    const timeStr = at ? at.toLocaleTimeString('en-NG', { hour: 'numeric', minute: '2-digit' }) : scheduled_at;
+    const dateStr = at ? at.toLocaleDateString('en-NG') : scheduled_at;
+    return {
+      type: 'replace',
+      text: `You're all set. Your appointment for ${data?.data?.booking?.service_title || 'your service'} is confirmed for ${dateStr} at ${timeStr}. We'll see you then.`,
+    };
+  } catch (e) {
+    console.error('[book_service] createBooking failed:', e.message);
+    return {
+      type: 'replace',
+      text: "We couldn't complete the booking right now. Please try again or contact the store directly.",
+    };
+  }
+}
+
 // ── Query specific product ────────────────────────────────────────────────────
 async function handleQueryInventory({ tenantId, subscriptionPlan, productName, intent,
     share_media = true, optionRequested = null, accessToken, phoneNumberId, customerPhone, prefetchedProducts }) {
 
-  if (!productName) {
+    if (!productName) {
     console.warn('[queryInventory] called with no product_name — skipping action, using Gemini reply');
     return null;
   }
@@ -1081,7 +1238,7 @@ async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineSt
     paymentInstructionType, paypalEmail, bankAccountName, bankName,
     bankAccountNumber, bankCode, paymentInstructions, messageId }) {
 
-  if (!defaultOnlineStoreId) {
+    if (!defaultOnlineStoreId) {
     return { type: 'replace', text: "This store isn't set up for online orders yet. Reach out to the merchant directly." };
   }
 
@@ -1162,7 +1319,7 @@ async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineSt
       return { type: 'replace', text: `"${item.product_name}" isn't available right now. Want to see what we have?` };
     }
 
-    const qty = item.quantity || 1;
+      const qty = item.quantity || 1;
     if (p.stock != null && p.stock < qty) {
       return { type: 'replace', text: `We only have ${p.stock} of the ${p.name} left — you wanted ${qty}. Want to adjust?` };
     }
@@ -1237,17 +1394,17 @@ async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineSt
     validItems.push({
       product_id:   p.id,
       variant_id:   resolvedVariantId,
-      product_name: p.name,
+        product_name: p.name,
       quantity:     qty,
       price:        finalUnitPrice,
-    });
-  }
+      });
+    }
 
   // Create the order (idempotent) — use inbound WhatsApp messageId as idempotency key
-  const orderResult = await backendApi.createOrder(tenantId, {
-    online_store_id: defaultOnlineStoreId,
+    const orderResult = await backendApi.createOrder(tenantId, {
+      online_store_id: defaultOnlineStoreId,
     items: validItems,
-    customer_info: {
+      customer_info: {
       name:             details.customer_name    || 'WhatsApp Customer',
       email:            details.customer_email   || '',
       phone:            details.customer_phone   || customerPhone,
