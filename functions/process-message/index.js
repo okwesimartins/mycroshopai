@@ -181,7 +181,8 @@ async function processMessage(messageData) {
       const orderNum = pendingOrder?.order_number || '';
       await safeSend(phoneNumberId, customerPhone, accessToken,
         `Your receipt for Order ${orderNum} has been received and is being reviewed by the store. ` +
-        `You'll get a notification here as soon as it's confirmed. Thank you for your patience! 🙏`
+        `You'll get a notification here as soon as it's confirmed.\n\n` +
+        `Before we proceed with another product enquiry or new purchase, this order needs to be confirmed first so we don't mix payments. Thanks for your patience. 🙏`
           );
           return;
         }
@@ -638,7 +639,7 @@ async function handleReceiptSubmission({
   const btnApprove = `approve_${orderId}_${customerPhone}`;
   const btnDecline = `decline_${orderId}_${customerPhone}`;
 
-  await whatsapp.sendInteractiveButtons(
+  const ownerSendResult = await whatsapp.sendInteractiveButtons(
     phoneNumberId, accessToken, ownerPhone,
     ownerBody,
     [
@@ -647,7 +648,21 @@ async function handleReceiptSubmission({
     ],
     `Order ${orderNumber}`,
     `Reply within 24hrs • ${storeNameResolved}`
-  ).catch(e => console.error('[receipt] owner notification failed:', e.message));
+  ).catch(e => {
+    console.error('[receipt] owner interactive notification failed:', e.message);
+    return null;
+  });
+
+  // Fallback: if interactive buttons fail (e.g. channel restriction), send plain text alert.
+  if (!ownerSendResult?.success) {
+    await whatsapp.sendMessage(
+      phoneNumberId,
+      accessToken,
+      ownerPhone,
+      `${ownerBody}\n\nReply in dashboard to approve or decline this payment.`,
+      null
+    ).catch(e => console.error('[receipt] owner text fallback failed:', e.message));
+  }
 
   log('owner', 'notification sent');
 }
@@ -1470,6 +1485,13 @@ function buildPaymentInstructions({ paymentInstructionType, paypalEmail, bankAcc
   }
 
   const type = (paymentInstructionType || '').toLowerCase();
+  const hasBankDetails = !!(bankAccountNumber || bankName || bankAccountName);
+  const isBankLikeType =
+    type === 'bank_transfer' ||
+    type === 'bank' ||
+    type === 'transfer' ||
+    type.includes('bank') ||
+    type.includes('transfer');
 
   if (type === 'paystack' && paymentLink) {
     return `*Pay online:*\n${paymentLink}\n\nOr tap the link above to pay securely with your card.`;
@@ -1479,7 +1501,17 @@ function buildPaymentInstructions({ paymentInstructionType, paypalEmail, bankAcc
     return `*Pay via PayPal:*\nSend ${total || 'the total amount'} to: *${paypalEmail}*\nUse "Goods & Services" and add the order number as reference.`;
   }
 
-  if (type === 'bank_transfer' && bankAccountNumber) {
+  if (isBankLikeType && hasBankDetails) {
+    let instr = `*Bank Transfer:*`;
+    if (bankName)          instr += `\nBank: ${bankName}`;
+    if (bankAccountName)   instr += `\nAccount Name: ${bankAccountName}`;
+    if (bankAccountNumber) instr += `\nAccount Number: *${bankAccountNumber}*`;
+    if (total)             instr += `\nAmount: *${total}*`;
+    return instr;
+  }
+
+  // If no payment link exists but bank details exist, still show bank transfer details.
+  if (!paymentLink && hasBankDetails) {
     let instr = `*Bank Transfer:*`;
     if (bankName)          instr += `\nBank: ${bankName}`;
     if (bankAccountName)   instr += `\nAccount Name: ${bankAccountName}`;
