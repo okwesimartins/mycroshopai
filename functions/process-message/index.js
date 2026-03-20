@@ -804,6 +804,11 @@ async function handleAction(action, ctx) {
         });
 
       case 'get_availability':
+        if (!action.service_id || !action.date) {
+          return await handleBookingIntentFromMessage({
+            tenantId, subscriptionPlan, defaultOnlineStoreId, message
+          });
+        }
         return await handleGetAvailability({
           tenantId, subscriptionPlan,
           service_id: action.service_id,
@@ -822,6 +827,11 @@ async function handleAction(action, ctx) {
         });
 
       case 'list_inventory':
+        if (isBookingIntentMessage(message)) {
+          return await handleBookingIntentFromMessage({
+            tenantId, subscriptionPlan, defaultOnlineStoreId, message
+          });
+        }
         return await handleListInventory({
           tenantId, subscriptionPlan,
           search:      action.search      ?? null,
@@ -831,6 +841,11 @@ async function handleAction(action, ctx) {
         });
 
       case 'query_inventory':
+        if (isBookingIntentMessage(message)) {
+          return await handleBookingIntentFromMessage({
+            tenantId, subscriptionPlan, defaultOnlineStoreId, message
+          });
+        }
         return await handleQueryInventory({
           tenantId, subscriptionPlan,
           productName:      action.product_name || extractProductName(message),
@@ -1006,6 +1021,43 @@ async function handleBookService({
       text: "We couldn't complete the booking right now. Please try again or contact the store directly.",
     };
   }
+}
+
+// ── Booking: infer service/date from natural user message ─────────────────────
+async function handleBookingIntentFromMessage({ tenantId, subscriptionPlan, defaultOnlineStoreId, message }) {
+  const servicesResult = await backendApi.listServices(tenantId, subscriptionPlan, {
+    ...(defaultOnlineStoreId ? { online_store_id: defaultOnlineStoreId } : {})
+  });
+  const services = servicesResult?.services || [];
+  if (!services.length) {
+    return { type: 'replace', text: "We don't have any bookable services at the moment." };
+  }
+
+  const lower = String(message || '').toLowerCase();
+  const pickedService = services.find(s => lower.includes((s.service_title || '').toLowerCase()));
+  const parsedDate = extractDateFromMessage(message);
+
+  if (pickedService && parsedDate) {
+    return await handleGetAvailability({
+      tenantId, subscriptionPlan,
+      service_id: pickedService.id,
+      date: parsedDate,
+      service_title: pickedService.service_title,
+    });
+  }
+
+  if (pickedService && !parsedDate) {
+    return {
+      type: 'replace',
+      text: `Sure — what date would you like for ${pickedService.service_title}? I can then show available time slots.`,
+    };
+  }
+
+  const lines = services.slice(0, 10).map((s, i) => `${i + 1}. ${s.service_title}`);
+  return {
+    type: 'replace',
+    text: `I can help you book a service. Here are available services:\n\n${lines.join('\n')}\n\nTell me the service and date (e.g. "Nail test566 on 2026-03-30").`,
+  };
 }
 
 // ── Query specific product ────────────────────────────────────────────────────
@@ -1481,7 +1533,17 @@ function buildPaymentInstructions({ paymentInstructionType, paypalEmail, bankAcc
 
   // Custom instructions from merchant take priority
   if (paymentInstructions?.trim()) {
-    return `*Payment Instructions:*\n${paymentInstructions.trim()}`;
+    // Keep merchant custom text, but append bank details if present so customers still get account info.
+    let custom = `*Payment Instructions:*\n${paymentInstructions.trim()}`;
+    const hasAnyBank = !!(bankName || bankAccountName || bankAccountNumber);
+    if (hasAnyBank && !/account\s*number|bank\s*:/i.test(paymentInstructions)) {
+      custom += `\n\n*Bank Transfer:*`;
+      if (bankName)          custom += `\nBank: ${bankName}`;
+      if (bankAccountName)   custom += `\nAccount Name: ${bankAccountName}`;
+      if (bankAccountNumber) custom += `\nAccount Number: *${bankAccountNumber}*`;
+      if (total)             custom += `\nAmount: *${total}*`;
+    }
+    return custom;
   }
 
   const type = (paymentInstructionType || '').toLowerCase();
@@ -1565,6 +1627,11 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
 
   const m = message.toLowerCase();
 
+  // Booking/date/time-slot requests should not be handled as inventory.
+  if (isBookingIntentMessage(message)) {
+    return { needed: false, search: null };
+  }
+
   // Generic product/catalog queries
   const genericPatterns = [
     /\b(what.*you have|what.*you got|what.*you sell|your products|your catalog|your items|price list|send.*catalog|show.*products|show.*items|wetin.*you get|watin.*you get|what.*in stock|see.*products)\b/,
@@ -1640,6 +1707,29 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
   }
 
   return { needed: false, search: null };
+}
+
+function isBookingIntentMessage(message = '') {
+  const m = String(message).toLowerCase();
+  return /\b(book|booking|appointment|schedule|service|services|available date|available dates|time slot|timeslot|slot|slots)\b/.test(m);
+}
+
+function extractDateFromMessage(message = '') {
+  const text = String(message).trim();
+  const iso = text.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  if (iso?.[1]) return iso[1];
+
+  const monthDay = text.match(/\b(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\s+(\d{1,2})(st|nd|rd|th)?\b/i);
+  if (monthDay) {
+    const d = new Date(`${monthDay[1]} ${monthDay[2]}, ${new Date().getFullYear()}`);
+    if (!Number.isNaN(d.getTime())) {
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${y}-${m}-${day}`;
+    }
+  }
+  return null;
 }
 
 /** Format products as readable text for prompt injection into Gemini */
