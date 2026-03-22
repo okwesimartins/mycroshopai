@@ -1057,26 +1057,26 @@ async function handleGetAvailability({ tenantId, subscriptionPlan, service_id, d
     };
   }
 
-  // No date: next N days from API (mode=range) — WhatsApp list step 1 = dates only; times after they pick a date
+  // No date: API returns bookable calendar dates (store JSON = only weekdays configured open)
   const range = await backendApi.getServiceAvailability(tenantId, service_id, null, subscriptionPlan, { days: 14 });
   const withSlots = (range?.dates || []).filter(d => d.slots?.length > 0);
   if (!withSlots.length || !range.total_slots) {
     return {
       type: 'replace',
-      text: `No open slots for ${service_title || 'this service'} in the next ${range?.days || 14} days. Try a specific date or contact the store.`,
+      text: `No open slots for ${service_title || 'this service'} right now. Try a specific date or contact the store.`,
     };
   }
 
   const rows = withSlots.slice(0, 10).map(d => ({
     id: `pickdate_${service_id}_${String(d.date).replace(/-/g, '')}`,
     title: formatShortDateForWhatsappList(d.date),
-    description: `${d.slots.length} time${d.slots.length === 1 ? '' : 's'} open`.slice(0, 72),
+    description: `${d.slots.length} slot${d.slots.length === 1 ? '' : 's'}`.slice(0, 72),
   }));
 
   return {
     type: 'send_date_list',
     introText:
-      `Here are days with openings for *${service_title || 'this service'}* (next ${range.days} days). Tap **Pick a date**, then choose a time.`,
+      `Here are upcoming days you can book for *${service_title || 'this service'}*. Tap **Pick a date**, then choose a time.`,
     bodyText: 'Pick a day that works for you.',
     buttonText: 'Pick a date',
     sections: [{ title: 'Available dates', rows }],
