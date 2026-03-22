@@ -251,6 +251,30 @@ async function processMessage(messageData) {
       return;
     }
 
+        // ── Booking preempt (before catalog + Gemini) ─────────────────────────
+    // Fixes: "availability for nail test" without get_availability from the model, and
+    // "let me see a list" after a service thread being treated as product catalog.
+    let bookingPreempt = null;
+    let ranBookingPreemptAttempt = false;
+    if (!incomingImageData && !buttonReply && !listReply) {
+      const tryBookingPreempt =
+        shouldAttemptBookingAvailabilityPreempt(msgText)
+        || (isVagueBookingListFollowUp(msgText) && conversationSuggestsActiveBookingContext(conversationHistory));
+      if (tryBookingPreempt) {
+        ranBookingPreemptAttempt = true;
+        bookingPreempt = await handleBookingIntentFromMessage({
+          tenantId,
+          subscriptionPlan,
+          defaultOnlineStoreId,
+          message: msgText,
+          conversationHistory,
+        });
+        if (bookingPreempt?.type === 'send_date_list' || bookingPreempt?.type === 'send_slot_list') {
+          log('booking-preempt', `handled as ${bookingPreempt.type} (skip catalog + model for this turn)`);
+        }
+      }
+    }
+
         // ── PRE-FETCH product data ───────────────────────────────────────────
     // Give Gemini REAL product data BEFORE it writes its reply.
     // KEY RULE: If customer says "can I see a picture" after mentioning a specific product,
@@ -261,7 +285,9 @@ async function processMessage(messageData) {
     // For incoming images, always pre-fetch the full catalog so Gemini can match the photo to a product
     const inventoryIntent = incomingImageData
       ? { needed: true, search: null, isImageSearch: true }
-      : detectInventoryIntent(msgText, conversationHistory, orderState);
+      : ranBookingPreemptAttempt
+        ? { needed: false, search: null }
+        : detectInventoryIntent(msgText, conversationHistory, orderState);
 
     if (inventoryIntent.needed) {
       try {
@@ -329,21 +355,29 @@ async function processMessage(messageData) {
       }
     }
 
-    const aiResponse = await ai.processMessage(msgText, {
-      tenant_id:            tenantId,
-      subscription_plan:    subscriptionPlan,
-      customer_phone:       customerPhone,
-      store_name:           storeNameResolved,
-      business_bio:         businessBio || null,
-      conversation_history: conversationHistory,
-      order_state:          orderState,
-      pending_order:        pendingOrder,
-      inventory_meta:       inventoryMeta,
-      quoted_context:       quotedContext,
-      incomingImage:        incomingImageData,  // base64 image for Gemini Vision
-    }, inventoryText).catch(e => { logErr('gemini', e); throw e; });
+    const skipGeminiForBooking =
+      bookingPreempt
+      && (bookingPreempt.type === 'send_date_list'
+        || bookingPreempt.type === 'send_slot_list'
+        || bookingPreempt.type === 'replace');
 
-    log('gemini', `reply="${aiResponse.text?.substring(0, 80)}" actions=[${aiResponse.actions?.map(a=>a.type).join(',')||'none'}]`);
+    const aiResponse = skipGeminiForBooking
+      ? { text: bookingPreempt.type === 'replace' ? (bookingPreempt.text || '') : '', actions: [], order_state: orderState }
+      : await ai.processMessage(msgText, {
+        tenant_id:            tenantId,
+        subscription_plan:    subscriptionPlan,
+        customer_phone:       customerPhone,
+        store_name:           storeNameResolved,
+        business_bio:         businessBio || null,
+        conversation_history: conversationHistory,
+        order_state:          orderState,
+        pending_order:        pendingOrder,
+        inventory_meta:       inventoryMeta,
+        quoted_context:       quotedContext,
+        incomingImage:        incomingImageData,  // base64 image for Gemini Vision
+      }, inventoryText).catch(e => { logErr('gemini', e); throw e; });
+
+    log('gemini', skipGeminiForBooking ? 'skipped (booking preempt)' : `reply="${aiResponse.text?.substring(0, 80)}" actions=[${aiResponse.actions?.map(a=>a.type).join(',')||'none'}]`);
 
     // ── Execute actions ──────────────────────────────────────────────────
     let finalReply    = aiResponse.text || '';
@@ -351,6 +385,20 @@ async function processMessage(messageData) {
     let newPending    = pendingOrder;
     let pendingImages = []; // images to send AFTER the text reply
     let pendingInteractiveList = null; // booking: date picker and/or time slots (WhatsApp list)
+
+    if (bookingPreempt?.type === 'send_date_list' || bookingPreempt?.type === 'send_slot_list') {
+      pendingInteractiveList = bookingPreempt;
+      finalReply =
+        bookingPreempt.introText
+        || (bookingPreempt.type === 'send_slot_list'
+          ? 'Tap **Pick a time** below to choose a slot.'
+          : '')
+        || finalReply
+        || bookingPreempt.bodyText
+        || 'Choose an option below.';
+    } else if (bookingPreempt?.type === 'replace' && skipGeminiForBooking) {
+      finalReply = bookingPreempt.text || finalReply;
+    }
 
     // Safety net: if Gemini emits list_inventory with share_media for a contextual picture request,
     // convert it to query_inventory for the specific product so we don't dump the whole catalog
@@ -874,7 +922,7 @@ async function handleAction(action, ctx) {
         // "what dates for Nail test566?". Route those to availability flow instead of dumping the full list.
         if (isBookingDateOrAvailabilityQuery(message) || shouldRouteListServicesToBooking(message)) {
           return await handleBookingIntentFromMessage({
-            tenantId, subscriptionPlan, defaultOnlineStoreId, message,
+            tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory,
           });
         }
         return await handleListServices({
@@ -884,7 +932,7 @@ async function handleAction(action, ctx) {
       case 'get_availability':
         if (!action.service_id) {
           return await handleBookingIntentFromMessage({
-            tenantId, subscriptionPlan, defaultOnlineStoreId, message
+            tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory,
           });
         }
         return await handleGetAvailability({
@@ -905,9 +953,12 @@ async function handleAction(action, ctx) {
         });
 
       case 'list_inventory':
-        if (isBookingIntentMessage(message)) {
+        if (
+          isBookingIntentMessage(message)
+          || (isVagueBookingListFollowUp(message) && conversationSuggestsActiveBookingContext(conversationHistory))
+        ) {
           return await handleBookingIntentFromMessage({
-            tenantId, subscriptionPlan, defaultOnlineStoreId, message
+            tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory,
           });
         }
         return await handleListInventory({
@@ -919,9 +970,12 @@ async function handleAction(action, ctx) {
         });
 
       case 'query_inventory':
-        if (isBookingIntentMessage(message)) {
+        if (
+          isBookingIntentMessage(message)
+          || (isVagueBookingListFollowUp(message) && conversationSuggestsActiveBookingContext(conversationHistory))
+        ) {
           return await handleBookingIntentFromMessage({
-            tenantId, subscriptionPlan, defaultOnlineStoreId, message
+            tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory,
           });
         }
         return await handleQueryInventory({
@@ -1274,7 +1328,9 @@ async function handleBookService({
 }
 
 // ── Booking: infer service/date from natural user message ─────────────────────
-async function handleBookingIntentFromMessage({ tenantId, subscriptionPlan, defaultOnlineStoreId, message }) {
+async function handleBookingIntentFromMessage({
+  tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory = [],
+}) {
   const servicesResult = await backendApi.listServices(tenantId, subscriptionPlan, {
     ...(defaultOnlineStoreId ? { online_store_id: defaultOnlineStoreId } : {})
   });
@@ -1283,9 +1339,12 @@ async function handleBookingIntentFromMessage({ tenantId, subscriptionPlan, defa
     return { type: 'replace', text: "We don't have any bookable services at the moment." };
   }
 
-  const lower = String(message || '').toLowerCase();
-  const pickedService = pickServiceFromUserMessage(services, message);
+  let pickedService = pickServiceFromUserMessage(services, message);
+  if (!pickedService && conversationHistory?.length) {
+    pickedService = pickServiceFromConversationHistory(services, conversationHistory);
+  }
   const parsedDate = extractDateFromMessage(message);
+  const vagueListFollowUp = isVagueBookingListFollowUp(message);
 
   if (pickedService && parsedDate) {
     return await handleGetAvailability({
@@ -1297,7 +1356,11 @@ async function handleBookingIntentFromMessage({ tenantId, subscriptionPlan, defa
   }
 
   if (pickedService && !parsedDate) {
-    if (isBookingDateOrAvailabilityQuery(message)) {
+    const showDatePicker =
+      isBookingDateOrAvailabilityQuery(message)
+      || (vagueListFollowUp && conversationSuggestsActiveBookingContext(conversationHistory));
+
+    if (showDatePicker) {
       return await handleGetAvailability({
         tenantId, subscriptionPlan,
         service_id: pickedService.id,
@@ -1875,6 +1938,80 @@ async function handlePaymentCheck(tenantId, message) {
 //  Intent detection + helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Recent chat looks like service / availability / booking — not shopping for products. */
+function conversationSuggestsActiveBookingContext(conversationHistory = []) {
+  const recent = conversationHistory.slice(-12);
+  let blob = '';
+  for (const m of recent) {
+    blob += `\n${String(m.text || m.content || '')}`;
+  }
+  const b = blob.toLowerCase();
+  if (/\bavailability\s+for\b/.test(b)) return true;
+  if (/\b(which|what)\s+date\b/.test(b)) return true;
+  if (/\b(book|booking)\s+(an?\s+)?(appointment|service)\b/.test(b)) return true;
+  if (/\btime\s*slot|\bschedule\b.*\bappointment\b/.test(b)) return true;
+  if (/\byou(?:'re| are) asking about\b/.test(b)) return true;
+  if (/\bthe\s+[''][^'']+['']\s+service\b/.test(b)) return true;
+  // Match AI replies like: "You're asking about the 'Nail test' service. Which date..."
+  if (/asking about the ['"][^'"]+['"]\s+service/i.test(b)) return true;
+  // Match AI replies referencing a service and asking for a date
+  if (/which date are you looking to book/i.test(b)) return true;
+  if (/\bdate.*(?:you want|to book|for that|to schedule)\b/i.test(b)) return true;
+  // Match when AI listed available time slots or dates
+  if (/\bavailable\s+(dates?|times?|slots?)\b/.test(b)) return true;
+  if (/\bpick\s+a\s+(date|time)\b/.test(b)) return true;
+  return false;
+}
+
+/** "Let me see a list" with no product words — usually means dates/slots when booking context applies. */
+function isVagueCatalogListRequest(message = '') {
+  const t = String(message).toLowerCase().trim();
+  if (t.length > 100) return false;
+  if (!/\blist\b/.test(t)) return false;
+  if (/\b(shoes|sneakers|boots|sandals|crocs|nike|product|products|item|items|catalogue|inventory|stock|pairs|sizes|colour|color|price)\b/.test(t)) {
+    return false;
+  }
+  return /\b(let me see|can i see|i want to see|show me|give me|send)\s+(a\s+|the\s+)?list\b/.test(t)
+    || /^\s*(show\s+(me\s+)?)?(the\s+)?list\s*\.?\s*$/i.test(t)
+    || /^(yes|yeah|yep|ok|okay)\b.*\blist\b/.test(t);
+}
+
+function isVagueBookingListFollowUp(message = '') {
+  const t = String(message).toLowerCase().trim();
+  if (t.length > 80) return false;
+  if (isVagueCatalogListRequest(message)) return true;
+  if (/\b(show|see)\s+(me\s+)?(the\s+)?(dates|availability|times|slots|options)\b/.test(t)) return true;
+  // "what dates", "which dates", "available dates" — no product words
+  if (/\b(what|which|any)\s+dates?\b/.test(t) && !/\b(shoes|sneakers|product|item)\b/.test(t)) return true;
+  // Short ambiguous "yes" / "ok, show me" after AI asked about dates
+  if (/^(yes|yeah|sure|ok|okay|show me|go ahead|proceed)\s*\.?\s*$/.test(t)) return true;
+  return false;
+}
+
+function shouldAttemptBookingAvailabilityPreempt(message = '') {
+  const m = String(message || '').trim();
+  if (!m) return false;
+  if (extractServicePhraseForBooking(m)) return true;
+  if (isBookingDateOrAvailabilityQuery(m) || shouldRouteListServicesToBooking(m)) return true;
+  if (/\bavailability\b/i.test(m) && /\bfor\b/i.test(m)) return true;
+  return false;
+}
+
+/**
+ * Re-use service name from earlier user turns (e.g. "availability for nail test" → later "show the list").
+ */
+function pickServiceFromConversationHistory(services, conversationHistory = []) {
+  if (!services?.length || !conversationHistory?.length) return null;
+  const userMsgs = [...conversationHistory].filter(x => x.role === 'user').slice(-6).reverse();
+  for (const um of userMsgs) {
+    const txt = String(um.text || um.content || '');
+    if (!txt.trim()) continue;
+    const p = pickServiceFromUserMessage(services, txt);
+    if (p) return p;
+  }
+  return null;
+}
+
 /**
  * Determine whether to pre-fetch inventory before calling Gemini.
  * Returns { needed: bool, search: string|null }
@@ -1892,6 +2029,11 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
 
   // Booking/date/time-slot requests should not be handled as inventory.
   if (isBookingIntentMessage(message)) {
+    return { needed: false, search: null };
+  }
+
+  // After discussing a service, "let me see a list" means dates/slots — not shoe catalog
+  if (isVagueCatalogListRequest(message) && conversationSuggestsActiveBookingContext(conversationHistory)) {
     return { needed: false, search: null };
   }
 
@@ -1974,7 +2116,7 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
 
 function isBookingIntentMessage(message = '') {
   const m = String(message).toLowerCase();
-  return /\b(book|booking|appointment|schedule|service|services|available date|available dates|what dates|which dates|time slot|timeslot|slot|slots)\b/.test(m);
+  return /\b(book|booking|appointment|schedule|service|services|available date|available dates|what dates|which dates|time slot|timeslot|slot|slots|availability)\b/.test(m);
 }
 
 /** User is asking for dates/slots/availability — not a generic "list all services". */
@@ -2083,19 +2225,70 @@ function pickServiceFromUserMessage(services, message) {
 
 function extractDateFromMessage(message = '') {
   const text = String(message).trim();
+
+  // Helper to format a Date object as YYYY-MM-DD
+  const fmt = d => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  };
+
+  const now = new Date();
+  const todayStr = fmt(now);
+
+  // ISO date: 2026-03-24
   const iso = text.match(/\b(\d{4}-\d{2}-\d{2})\b/);
   if (iso?.[1]) return iso[1];
 
-  const monthDay = text.match(/\b(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\s+(\d{1,2})(st|nd|rd|th)?\b/i);
+  // Relative words: today, tomorrow, day after tomorrow
+  const lower = text.toLowerCase();
+  if (/\btoday\b/.test(lower)) return todayStr;
+  if (/\btomorrow\b/.test(lower)) {
+    const d = new Date(now); d.setDate(d.getDate() + 1); return fmt(d);
+  }
+  if (/\bday after tomorrow\b/.test(lower)) {
+    const d = new Date(now); d.setDate(d.getDate() + 2); return fmt(d);
+  }
+
+  // "next monday", "this friday", etc.
+  const weekdays = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+  const nextDayMatch = lower.match(/\b(?:next|this)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+  if (nextDayMatch) {
+    const targetDay = weekdays.indexOf(nextDayMatch[1]);
+    const d = new Date(now);
+    const diff = (targetDay - d.getDay() + 7) % 7 || 7; // always go forward
+    d.setDate(d.getDate() + diff);
+    return fmt(d);
+  }
+
+  // "on monday", "monday" standalone — nearest upcoming occurrence
+  const plainDayMatch = lower.match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+  if (plainDayMatch) {
+    const targetDay = weekdays.indexOf(plainDayMatch[1]);
+    const d = new Date(now);
+    const diff = (targetDay - d.getDay() + 7) % 7 || 7;
+    d.setDate(d.getDate() + diff);
+    return fmt(d);
+  }
+
+  // "March 24", "24 March", "March 24th"
+  const monthDay = text.match(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?\b/i)
+    || text.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/i);
   if (monthDay) {
-    const d = new Date(`${monthDay[1]} ${monthDay[2]}, ${new Date().getFullYear()}`);
-    if (!Number.isNaN(d.getTime())) {
-      const y = d.getFullYear();
-      const m = String(d.getMonth() + 1).padStart(2, '0');
-      const day = String(d.getDate()).padStart(2, '0');
-      return `${y}-${m}-${day}`;
+    // figure out which capture is month vs day
+    const isMonthFirst = /^[a-z]/i.test(monthDay[1]);
+    const monthStr = isMonthFirst ? monthDay[1] : monthDay[2];
+    const dayNum   = isMonthFirst ? monthDay[2] : monthDay[1];
+    let year = now.getFullYear();
+    const candidate = new Date(`${monthStr} ${dayNum}, ${year}`);
+    // If that date has already passed this year, assume next year
+    if (!Number.isNaN(candidate.getTime())) {
+      if (candidate < now) candidate.setFullYear(year + 1);
+      return fmt(candidate);
     }
   }
+
   return null;
 }
 
