@@ -123,6 +123,22 @@ async function processMessage(messageData) {
       return;
     }
 
+    // ── Booking: "More dates" pagination (list row) ─────────────────────────
+    if (listReply?.id && String(listReply.id).startsWith('moredates_')) {
+      await handleBookingMoreDatesList({
+        listReply, tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken,
+      });
+      return;
+    }
+
+    // ── Booking: "More times" pagination (list row) ─────────────────────────
+    if (listReply?.id && String(listReply.id).startsWith('moretimes_')) {
+      await handleBookingMoreTimesList({
+        listReply, tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken,
+      });
+      return;
+    }
+
     // ── Booking: user picked a date (then we show times) ───────────────────
     // listReply.id: pickdate_<serviceId>_<YYYYMMDD> e.g. pickdate_6_20260324
     if (listReply?.id && String(listReply.id).startsWith('pickdate_')) {
@@ -783,19 +799,18 @@ async function handleBookingDateSelection({
     return;
   }
 
-  const rows = day.slots.slice(0, 10).map(s => ({
-    id: `slot_${serviceId}_${dateStr}_${s.slot}`,
-    title: String(s.label).slice(0, 24),
-  }));
-
-  const body = `Pick a time for *${title}* on *${dateStr}*:`;
+  const rows = buildTimeSlotListRows(day.slots, serviceId, dateStr, 0);
+  const hasMore = rows.some(r => String(r.id).startsWith('moretimes_'));
+  const body = hasMore
+    ? `Pick a time for *${title}* on *${dateStr}* (More times → if needed):`
+    : `Pick a time for *${title}* on *${dateStr}*:`;
   await whatsapp.sendInteractiveList(
     phoneNumberId, accessToken, customerPhone,
     body,
     'Pick a time',
     [{ title: 'Times', rows }]
   ).catch(e => log('send', e.message));
-  log('done', `Sent ${rows.length} time options for ${dateStr}`);
+  log('done', `Sent ${rows.filter(r => !String(r.id).startsWith('moretimes_')).length} time rows (+more?) for ${dateStr}`);
 }
 
 // ── Booking: user tapped a time slot from the interactive list ─────────────────
@@ -1016,6 +1031,165 @@ async function handleListInventory({ tenantId, subscriptionPlan, search, share_m
   return { type: 'data', text: text.trim() };
 }
 
+// WhatsApp interactive lists: max 10 rows total — reserve 1 row for "More dates" / "More times"
+const WA_DATE_OPTIONS_PER_PAGE = 8;
+const WA_TIME_OPTIONS_PER_PAGE = 8;
+
+function ymdAddDays(ymd, deltaDays) {
+  const [y, m, d] = String(ymd).slice(0, 10).split('-').map(Number);
+  const dt = new Date(y, m - 1, d + deltaDays);
+  const yy = dt.getFullYear();
+  const mm = String(dt.getMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getDate()).padStart(2, '0');
+  return `${yy}-${mm}-${dd}`;
+}
+
+/** Rows for one page of time slots; optional "More times" row (id moretimes_...) */
+function buildTimeSlotListRows(allSlots, serviceId, dateStr, startOffset = 0) {
+  const slots = allSlots || [];
+  const slice = slots.slice(startOffset, startOffset + WA_TIME_OPTIONS_PER_PAGE);
+  const rows = slice.map(s => ({
+    id: `slot_${serviceId}_${dateStr}_${s.slot}`,
+    title: String(s.label).slice(0, 24),
+  }));
+  if (startOffset + slice.length < slots.length) {
+    const nextOff = startOffset + slice.length;
+    rows.push({
+      id: `moretimes_${serviceId}_${String(dateStr).replace(/-/g, '')}_${nextOff}`,
+      title: 'More times →',
+      description: 'Next slots',
+    });
+  }
+  return rows;
+}
+
+/**
+ * First page or "More dates" — fetches up to (page size + 1) bookable days to detect hasMore.
+ * @param {string|null} scanFromYmd - YYYY-MM-DD for next page; null = backend default (today)
+ */
+async function buildDateListInteractiveResult(tenantId, subscriptionPlan, serviceId, serviceTitle, scanFromYmd = null) {
+  const fetchCount = WA_DATE_OPTIONS_PER_PAGE + 1;
+  const opts = { days: fetchCount };
+  if (scanFromYmd) opts.from = scanFromYmd;
+
+  const range = await backendApi.getServiceAvailability(tenantId, serviceId, null, subscriptionPlan, opts);
+  const withSlots = (range?.dates || []).filter(d => d.slots?.length > 0);
+
+  if (!withSlots.length || !range.total_slots) {
+    if (scanFromYmd) {
+      return {
+        type: 'replace',
+        text: 'No more bookable days in that range. Try typing a date (e.g. 2026-04-15) or ask for availability again.',
+      };
+    }
+    return {
+      type: 'replace',
+      text: `No open slots for ${serviceTitle || 'this service'} right now. Try a specific date or contact the store.`,
+    };
+  }
+
+  const hasMore = withSlots.length > WA_DATE_OPTIONS_PER_PAGE;
+  const pageDates = hasMore ? withSlots.slice(0, WA_DATE_OPTIONS_PER_PAGE) : withSlots;
+  const lastDate = pageDates[pageDates.length - 1].date;
+  const nextFrom = hasMore ? ymdAddDays(lastDate, 1) : null;
+
+  const rows = pageDates.map(d => ({
+    id: `pickdate_${serviceId}_${String(d.date).replace(/-/g, '')}`,
+    title: formatShortDateForWhatsappList(d.date),
+    description: `${d.slots.length} slot${d.slots.length === 1 ? '' : 's'}`.slice(0, 72),
+  }));
+
+  if (nextFrom) {
+    rows.push({
+      id: `moredates_${serviceId}_${nextFrom.replace(/-/g, '')}`,
+      title: 'More dates →',
+      description: 'Later days',
+    });
+  }
+
+  return {
+    type: 'send_date_list',
+    introText: scanFromYmd
+      ? `Here are more days you can book for *${serviceTitle || 'this service'}*.`
+      : `To choose a day: tap the *Pick a date* button on the next message, then tap your day in the list. After that you’ll pick a time the same way.`,
+    bodyText: nextFrom
+      ? 'Tap the button, then select a date (use More dates → at the bottom for later days).'
+      : 'Tap the button below, then select your date from the list.',
+    buttonText: 'Pick a date',
+    sections: [{ title: 'Dates', rows }],
+  };
+}
+
+async function handleBookingMoreDatesList({
+  listReply, tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken,
+}) {
+  const log = (tag, ...a) => console.log(`[booking-moredates:${tag}]`, ...a);
+  const m = String(listReply.id || '').match(/^moredates_(\d+)_(\d{8})$/);
+  if (!m) {
+    log('skip', 'bad id', listReply.id);
+    return;
+  }
+  const serviceId = parseInt(m[1], 10);
+  const compact = m[2];
+  const scanFrom = `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}`;
+  if (!serviceId || compact.length !== 8) return;
+
+  const svcList = await backendApi.listServices(tenantId, subscriptionPlan, {}).catch(() => null);
+  const svc = svcList?.services?.find(s => s.id === serviceId);
+  const title = svc?.service_title || 'your appointment';
+
+  const result = await buildDateListInteractiveResult(tenantId, subscriptionPlan, serviceId, title, scanFrom);
+  if (result.type === 'replace') {
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, result.text, null).catch(() => {});
+    return;
+  }
+  if (result.introText) {
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, result.introText, null).catch(() => {});
+  }
+  await whatsapp.sendInteractiveList(
+    phoneNumberId, accessToken, customerPhone,
+    result.bodyText,
+    result.buttonText,
+    result.sections
+  ).catch(e => log('send', e.message));
+}
+
+async function handleBookingMoreTimesList({
+  listReply, tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken,
+}) {
+  const log = (tag, ...a) => console.log(`[booking-moretimes:${tag}]`, ...a);
+  const m = String(listReply.id || '').match(/^moretimes_(\d+)_(\d{8})_(\d+)$/);
+  if (!m) {
+    log('skip', 'bad id', listReply.id);
+    return;
+  }
+  const serviceId = parseInt(m[1], 10);
+  const dateStr = `${m[2].slice(0, 4)}-${m[2].slice(4, 6)}-${m[2].slice(6, 8)}`;
+  const startOffset = parseInt(m[3], 10);
+  if (!serviceId || !dateStr || Number.isNaN(startOffset)) return;
+
+  const svcList = await backendApi.listServices(tenantId, subscriptionPlan, {}).catch(() => null);
+  const svc = svcList?.services?.find(s => s.id === serviceId);
+  const title = svc?.service_title || 'your appointment';
+
+  const day = await backendApi.getServiceAvailability(tenantId, serviceId, dateStr, subscriptionPlan);
+  if (!day?.slots?.length) {
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone,
+      `No times left for ${title} on ${dateStr}.`, null
+    ).catch(() => {});
+    return;
+  }
+
+  const rows = buildTimeSlotListRows(day.slots, serviceId, dateStr, startOffset);
+  const body = `More times for *${title}* on *${dateStr}*:`;
+  await whatsapp.sendInteractiveList(
+    phoneNumberId, accessToken, customerPhone,
+    body,
+    'Pick a time',
+    [{ title: 'Times', rows }]
+  ).catch(e => log('send', e.message));
+}
+
 // ── Booking: list services ────────────────────────────────────────────────────
 async function handleListServices({ tenantId, subscriptionPlan, defaultOnlineStoreId }) {
   const result = await backendApi.listServices(tenantId, subscriptionPlan, {
@@ -1045,42 +1219,26 @@ async function handleGetAvailability({ tenantId, subscriptionPlan, service_id, d
         text: `No available slots for ${service_title || 'this service'} on ${date}. Pick another date?`,
       };
     }
-    const rows = result.slots.slice(0, 10).map(s => ({
-      id: `slot_${service_id}_${date}_${s.slot}`,
-      title: s.label,
-    }));
+    const rows = buildTimeSlotListRows(result.slots, service_id, date, 0);
+    const hasMore = rows.some(r => String(r.id).startsWith('moretimes_'));
     return {
       type: 'send_slot_list',
-      bodyText: `Pick a time for ${service_title || 'your appointment'} on ${date}:`,
+      bodyText: hasMore
+        ? `Pick a time for ${service_title || 'your appointment'} on ${date} (tap More times → if needed):`
+        : `Pick a time for ${service_title || 'your appointment'} on ${date}:`,
       buttonText: 'Pick a time',
       sections: [{ title: 'Available times', rows }],
     };
   }
 
-  // No date: API returns bookable calendar dates (store JSON = only weekdays configured open)
-  const range = await backendApi.getServiceAvailability(tenantId, service_id, null, subscriptionPlan, { days: 14 });
-  const withSlots = (range?.dates || []).filter(d => d.slots?.length > 0);
-  if (!withSlots.length || !range.total_slots) {
-    return {
-      type: 'replace',
-      text: `No open slots for ${service_title || 'this service'} right now. Try a specific date or contact the store.`,
-    };
-  }
-
-  const rows = withSlots.slice(0, 10).map(d => ({
-    id: `pickdate_${service_id}_${String(d.date).replace(/-/g, '')}`,
-    title: formatShortDateForWhatsappList(d.date),
-    description: `${d.slots.length} slot${d.slots.length === 1 ? '' : 's'}`.slice(0, 72),
-  }));
-
-  return {
-    type: 'send_date_list',
-    introText:
-      `Here are upcoming days you can book for *${service_title || 'this service'}*. Tap **Pick a date**, then choose a time.`,
-    bodyText: 'Pick a day that works for you.',
-    buttonText: 'Pick a date',
-    sections: [{ title: 'Available dates', rows }],
-  };
+  // No date: paginated bookable dates (8 + "More dates →" when needed)
+  return buildDateListInteractiveResult(
+    tenantId,
+    subscriptionPlan,
+    service_id,
+    service_title,
+    null
+  );
 }
 
 // ── Booking: create booking (when Gemini has all details) ──────────────────────
