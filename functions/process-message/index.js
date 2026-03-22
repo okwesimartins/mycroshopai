@@ -123,6 +123,15 @@ async function processMessage(messageData) {
       return;
     }
 
+    // ── Booking: user picked a date (then we show times) ───────────────────
+    // listReply.id: pickdate_<serviceId>_<YYYYMMDD> e.g. pickdate_6_20260324
+    if (listReply?.id && String(listReply.id).startsWith('pickdate_')) {
+      await handleBookingDateSelection({
+        listReply, tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken,
+      });
+      return;
+    }
+
     // ── Booking: user selected a time slot from interactive list ─────────
     // listReply.id format: slot_<serviceId>_<date>_<time> e.g. slot_5_2025-03-09_09:00
     if (listReply?.id && String(listReply.id).startsWith('slot_')) {
@@ -325,7 +334,7 @@ async function processMessage(messageData) {
     let newOrderState = aiResponse.order_state || orderState;
     let newPending    = pendingOrder;
     let pendingImages = []; // images to send AFTER the text reply
-    let pendingSlotList = null; // interactive list of time slots for booking
+    let pendingInteractiveList = null; // booking: date picker and/or time slots (WhatsApp list)
 
     // Safety net: if Gemini emits list_inventory with share_media for a contextual picture request,
     // convert it to query_inventory for the specific product so we don't dump the whole catalog
@@ -407,9 +416,11 @@ async function processMessage(messageData) {
           pendingImages.push(...result.images);
         }
 
-      } else if (result.type === 'send_slot_list') {
-        // Booking: show time slots as interactive list (tap to select)
-        pendingSlotList = result;
+      } else if (result.type === 'send_slot_list' || result.type === 'send_date_list') {
+        pendingInteractiveList = result;
+        if (result.type === 'send_date_list' && result.introText) {
+          finalReply = result.introText;
+        }
       } else if (result.type === 'noop') {
         // Action completed (e.g. images sent) but no text change needed — leave finalReply as-is
       }
@@ -492,14 +503,14 @@ async function processMessage(messageData) {
       ));
     }
 
-    // BOOKING: send interactive list of time slots (user taps to confirm slot)
-    if (pendingSlotList?.sections?.length) {
+    // BOOKING: interactive list — pick a date first, then times (same Cloud API)
+    if (pendingInteractiveList?.sections?.length) {
       whatsapp.sendInteractiveList(
         phoneNumberId, accessToken, customerPhone,
-        pendingSlotList.bodyText || 'Pick a time slot:',
-        pendingSlotList.buttonText || 'Pick a time',
-        pendingSlotList.sections
-      ).catch(e => logErr('sendSlotList', e));
+        pendingInteractiveList.bodyText || 'Choose an option:',
+        pendingInteractiveList.buttonText || 'Open',
+        pendingInteractiveList.sections
+      ).catch(e => logErr('sendInteractiveList', e));
     }
 
     // ── Remaining writes — fire and forget ───────────────────────────────
@@ -744,25 +755,70 @@ async function handleOwnerButtonReply({ buttonReply, tenantId, phoneNumberId, ac
   log('done', `Customer notified, state → ${newState}`);
 }
 
+// ── Booking: user picked a date → show time list for that day ───────────────────
+// listReply.id = pickdate_<serviceId>_<YYYYMMDD> (no dashes in date part)
+async function handleBookingDateSelection({
+  listReply, tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken,
+}) {
+  const log = (tag, ...a) => console.log(`[booking-date:${tag}]`, ...a);
+  const m = String(listReply.id || '').match(/^pickdate_(\d+)_(\d{8})$/);
+  if (!m) {
+    log('skip', 'invalid pickdate id:', listReply.id);
+    return;
+  }
+  const serviceId = parseInt(m[1], 10);
+  const compact = m[2];
+  const dateStr = `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}`;
+  if (!serviceId || compact.length !== 8) return;
+
+  const svcList = await backendApi.listServices(tenantId, subscriptionPlan, {}).catch(() => null);
+  const svc = svcList?.services?.find(s => s.id === serviceId);
+  const title = svc?.service_title || 'your appointment';
+
+  const day = await backendApi.getServiceAvailability(tenantId, serviceId, dateStr, subscriptionPlan);
+  if (!day?.slots?.length) {
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone,
+      `No times left for ${title} on ${dateStr}. Pick another date?`, null
+    ).catch(() => {});
+    return;
+  }
+
+  const rows = day.slots.slice(0, 10).map(s => ({
+    id: `slot_${serviceId}_${dateStr}_${s.slot}`,
+    title: String(s.label).slice(0, 24),
+  }));
+
+  const body = `Pick a time for *${title}* on *${dateStr}*:`;
+  await whatsapp.sendInteractiveList(
+    phoneNumberId, accessToken, customerPhone,
+    body,
+    'Pick a time',
+    [{ title: 'Times', rows }]
+  ).catch(e => log('send', e.message));
+  log('done', `Sent ${rows.length} time options for ${dateStr}`);
+}
+
 // ── Booking: user tapped a time slot from the interactive list ─────────────────
-// listReply.id = "slot_<serviceId>_<date>_<time>" e.g. slot_5_2025-03-09_09:00
+// listReply.id = slot_<serviceId>_YYYY-MM-DD_<HH:mm> (date contains dashes — use regex)
 async function handleBookingSlotSelection({
   listReply, tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken, storeName
 }) {
   const log = (tag, ...a) => console.log(`[booking-slot:${tag}]`, ...a);
-  const parts = String(listReply.id || '').split('_');
-  if (parts.length < 4 || parts[0] !== 'slot') {
+  const id = String(listReply.id || '');
+  const m = id.match(/^slot_(\d+)_(\d{4}-\d{2}-\d{2})_(.+)$/);
+  if (!m) {
     log('skip', 'invalid slot id:', listReply.id);
     return;
   }
-  const serviceId = parseInt(parts[1], 10);
-  const dateStr = parts[2];
-  const timeStr = parts[3];
+  const serviceId = parseInt(m[1], 10);
+  const dateStr = m[2];
+  const timeStr = m[3];
   if (!serviceId || !dateStr || !timeStr) {
     log('skip', 'missing service/date/time');
     return;
   }
-  const scheduledAt = `${dateStr}T${timeStr.length === 5 ? timeStr : timeStr + ':00'}:00`;
+  const hm = /^\d{1,2}:\d{2}$/.test(timeStr) ? timeStr : `${timeStr.slice(0, 2)}:${timeStr.slice(2, 4)}`;
+  const scheduledAt = `${dateStr}T${hm}:00`;
   try {
     await backendApi.createBooking(tenantId, {
       service_id: serviceId,
@@ -1001,44 +1057,29 @@ async function handleGetAvailability({ tenantId, subscriptionPlan, service_id, d
     };
   }
 
-  // No date: next N days from API (mode=range)
+  // No date: next N days from API (mode=range) — WhatsApp list step 1 = dates only; times after they pick a date
   const range = await backendApi.getServiceAvailability(tenantId, service_id, null, subscriptionPlan, { days: 14 });
-  if (!range?.dates?.length || !range.total_slots) {
+  const withSlots = (range?.dates || []).filter(d => d.slots?.length > 0);
+  if (!withSlots.length || !range.total_slots) {
     return {
       type: 'replace',
       text: `No open slots for ${service_title || 'this service'} in the next ${range?.days || 14} days. Try a specific date or contact the store.`,
     };
   }
 
-  const lines = [];
-  for (const d of range.dates) {
-    if (!d.slots?.length) continue;
-    const times = d.slots.slice(0, 6).map(s => s.label).join(', ');
-    const more = d.slots.length > 6 ? ` (+${d.slots.length - 6} more)` : '';
-    lines.push(`• ${d.date}: ${times}${more}`);
-  }
-  const summary = lines.slice(0, 8).join('\n');
-
-  const flat = [];
-  for (const d of range.dates) {
-    for (const s of d.slots || []) {
-      flat.push({ date: d.date, slot: s.slot, label: s.label });
-      if (flat.length >= 10) break;
-    }
-    if (flat.length >= 10) break;
-  }
-  const rows = flat.map(s => ({
-    id: `slot_${service_id}_${s.date}_${s.slot}`,
-    title: `${s.date.slice(5)} ${s.label}`.slice(0, 24),
+  const rows = withSlots.slice(0, 10).map(d => ({
+    id: `pickdate_${service_id}_${String(d.date).replace(/-/g, '')}`,
+    title: formatShortDateForWhatsappList(d.date),
+    description: `${d.slots.length} time${d.slots.length === 1 ? '' : 's'} open`.slice(0, 72),
   }));
 
   return {
-    type: 'send_slot_list',
-    bodyText:
-      `Here’s availability for *${service_title || 'your appointment'}* (next ${range.days} days):\n\n${summary}` +
-      (lines.length > 8 ? `\n\n…tap below to pick a time (first ${flat.length} options shown).` : '\n\nTap a time below.'),
-    buttonText: 'Pick a time',
-    sections: [{ title: 'Times', rows }],
+    type: 'send_date_list',
+    introText:
+      `Here are days with openings for *${service_title || 'this service'}* (next ${range.days} days). Tap **Pick a date**, then choose a time.`,
+    bodyText: 'Pick a day that works for you.',
+    buttonText: 'Pick a date',
+    sections: [{ title: 'Available dates', rows }],
   };
 }
 
@@ -1120,7 +1161,7 @@ async function handleBookingIntentFromMessage({ tenantId, subscriptionPlan, defa
   const lines = services.slice(0, 10).map((s, i) => `${i + 1}. ${s.service_title}`);
   return {
     type: 'replace',
-    text: `I can help you book a service. Here are available services:\n\n${lines.join('\n')}\n\nTell me the service and date (e.g. "Nail test566 on 2026-03-30").`,
+    text: `I can help you book a service. Here are available services:\n\n${lines.join('\n')}\n\nTell me the service and date (e.g. "Nail test on 2026-03-30").`,
   };
 }
 
@@ -1792,37 +1833,94 @@ function shouldRouteListServicesToBooking(message = '') {
   return /\b(book|booking|appointment|for your|for the|for my|dates for|availability for)\b/.test(m);
 }
 
+/** Pull service name from "availability for X", "see … for X", etc. */
+function extractServicePhraseForBooking(message) {
+  const raw = String(message || '').trim();
+  if (!raw) return null;
+  const pats = [
+    /\bsee\s+(?:the\s+)?availability\s+for\s+(.+?)(?:\s+on\b|\?|$|\.(?:\s|$))/i,
+    /\bavailability\s+for\s+(.+?)(?:\s+on\b|\?|$|\.(?:\s|$))/i,
+    /\bavailability\s+of\s+(.+?)(?:\s+on\b|\?|$|\.(?:\s|$))/i,
+    /\bopenings?\s+for\s+(.+?)(?:\s+on\b|\?|$|\.(?:\s|$))/i,
+    /\bdates?\s+for\s+(.+?)(?:\s+on\b|\?|$|\.(?:\s|$))/i,
+    /\bbook(?:ing)?\s+(?:a\s+|an\s+)?(.+?)(?:\s+on\b|\s+for\b|\?|$)/i,
+    /\bfor\s+my\s+(.+?)\s+(?:appointment|booking)\b/i,
+  ];
+  for (const p of pats) {
+    const m = raw.match(p);
+    if (m && m[1]) {
+      let s = m[1].trim().replace(/\s+/g, ' ');
+      s = s.replace(/^(the|a|an)\s+/i, '').trim();
+      if (s.length >= 2) return s;
+    }
+  }
+  return null;
+}
+
+function formatShortDateForWhatsappList(ymd) {
+  const d = new Date(String(ymd).slice(0, 10) + 'T12:00:00');
+  if (Number.isNaN(d.getTime())) return String(ymd).slice(0, 10).slice(0, 24);
+  const w = d.toLocaleDateString('en-US', { weekday: 'short' });
+  const rest = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  const out = `${w} ${rest}`;
+  return out.length > 24 ? out.slice(0, 24) : out;
+}
+
 /**
- * Match user text to a StoreService title (substring, then fuzzy token overlap).
+ * Match user text to a StoreService title.
+ * Prefers exact / word-boundary prefix over longer titles (e.g. "Nail test" vs "Nail test566").
  */
 function pickServiceFromUserMessage(services, message) {
   const lower = String(message || '').toLowerCase();
   if (!services?.length) return null;
+  const phrase = (extractServicePhraseForBooking(message) || '').toLowerCase().trim();
 
-  const bySubstring = services.find(s => {
+  function rank(s) {
     const t = (s.service_title || '').toLowerCase().trim();
-    if (!t) return false;
-    if (lower.includes(t)) return true;
-    // "nail test" matches "nail test566" — strip digits from title for loose match
+    if (!t) return null;
+    if (phrase) {
+      if (t === phrase) return { score: 100, len: t.length };
+      const tNoDig = t.replace(/\d+/g, ' ').replace(/\s+/g, ' ').trim();
+      if (phrase === tNoDig) return { score: 85, len: t.length };
+      if (t.startsWith(phrase) && (t.length === phrase.length || t[phrase.length] === ' ')) {
+        return { score: 80, len: t.length };
+      }
+      if (t.startsWith(phrase)) return { score: 50, len: t.length };
+      if (t.includes(phrase)) return { score: 35, len: t.length };
+    }
+    if (lower.includes(t)) return { score: 40, len: t.length };
     const tNoDigits = t.replace(/\d+/g, ' ').replace(/\s+/g, ' ').trim();
-    if (tNoDigits.length > 3 && lower.includes(tNoDigits)) return true;
-    return false;
-  });
-  if (bySubstring) return bySubstring;
+    if (tNoDigits.length > 3 && lower.includes(tNoDigits)) return { score: 25, len: t.length };
+    return null;
+  }
+
+  let best = null;
+  let bestScore = -1;
+  let bestLen = Infinity;
+  for (const s of services) {
+    const r = rank(s);
+    if (!r) continue;
+    if (r.score > bestScore || (r.score === bestScore && r.len < bestLen)) {
+      bestScore = r.score;
+      bestLen = r.len;
+      best = s;
+    }
+  }
+  if (best) return best;
 
   const msgTokens = lower.split(/[^a-z0-9]+/).filter(w => w.length > 2);
-  let best = null;
-  let bestScore = 0;
+  let fuzzy = null;
+  let bestOverlap = 0;
   for (const s of services) {
     const t = (s.service_title || '').toLowerCase();
     const titleTokens = t.split(/[^a-z0-9]+/).filter(w => w.length > 2);
     const overlap = msgTokens.filter(w => titleTokens.some(tt => tt.includes(w) || w.includes(tt))).length;
-    if (overlap > bestScore) {
-      bestScore = overlap;
-      best = s;
+    if (overlap > bestOverlap) {
+      bestOverlap = overlap;
+      fuzzy = s;
     }
   }
-  return bestScore >= 2 ? best : null;
+  return bestOverlap >= 2 ? fuzzy : null;
 }
 
 function extractDateFromMessage(message = '') {
