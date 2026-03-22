@@ -799,12 +799,19 @@ async function handleAction(action, ctx) {
   try {
     switch (action.type) {
       case 'list_services':
+        // Gemini often emits list_services for ANY booking question — including
+        // "what dates for Nail test566?". Route those to availability flow instead of dumping the full list.
+        if (isBookingDateOrAvailabilityQuery(message) || shouldRouteListServicesToBooking(message)) {
+          return await handleBookingIntentFromMessage({
+            tenantId, subscriptionPlan, defaultOnlineStoreId, message,
+          });
+        }
         return await handleListServices({
           tenantId, subscriptionPlan, defaultOnlineStoreId,
         });
 
       case 'get_availability':
-        if (!action.service_id || !action.date) {
+        if (!action.service_id) {
           return await handleBookingIntentFromMessage({
             tenantId, subscriptionPlan, defaultOnlineStoreId, message
           });
@@ -812,7 +819,7 @@ async function handleAction(action, ctx) {
         return await handleGetAvailability({
           tenantId, subscriptionPlan,
           service_id: action.service_id,
-          date: action.date,
+          date: action.date || null,
           service_title: action.service_title,
         });
 
@@ -971,23 +978,67 @@ async function handleListServices({ tenantId, subscriptionPlan, defaultOnlineSto
 
 // ── Booking: get availability and return interactive slot list ──────────────────
 async function handleGetAvailability({ tenantId, subscriptionPlan, service_id, date, service_title }) {
-  if (!service_id || !date) return null;
-  const result = await backendApi.getServiceAvailability(tenantId, service_id, date, subscriptionPlan);
-  if (!result?.slots?.length) {
+  if (!service_id) return null;
+
+  // Single day
+  if (date) {
+    const result = await backendApi.getServiceAvailability(tenantId, service_id, date, subscriptionPlan);
+    if (!result?.slots?.length) {
+      return {
+        type: 'replace',
+        text: `No available slots for ${service_title || 'this service'} on ${date}. Pick another date?`,
+      };
+    }
+    const rows = result.slots.slice(0, 10).map(s => ({
+      id: `slot_${service_id}_${date}_${s.slot}`,
+      title: s.label,
+    }));
     return {
-      type: 'replace',
-      text: `No available slots for ${service_title || 'this service'} on ${date}. Pick another date?`,
+      type: 'send_slot_list',
+      bodyText: `Pick a time for ${service_title || 'your appointment'} on ${date}:`,
+      buttonText: 'Pick a time',
+      sections: [{ title: 'Available times', rows }],
     };
   }
-  const rows = result.slots.slice(0, 10).map(s => ({
-    id: `slot_${service_id}_${date}_${s.slot}`,
-    title: s.label,
+
+  // No date: next N days from API (mode=range)
+  const range = await backendApi.getServiceAvailability(tenantId, service_id, null, subscriptionPlan, { days: 14 });
+  if (!range?.dates?.length || !range.total_slots) {
+    return {
+      type: 'replace',
+      text: `No open slots for ${service_title || 'this service'} in the next ${range?.days || 14} days. Try a specific date or contact the store.`,
+    };
+  }
+
+  const lines = [];
+  for (const d of range.dates) {
+    if (!d.slots?.length) continue;
+    const times = d.slots.slice(0, 6).map(s => s.label).join(', ');
+    const more = d.slots.length > 6 ? ` (+${d.slots.length - 6} more)` : '';
+    lines.push(`• ${d.date}: ${times}${more}`);
+  }
+  const summary = lines.slice(0, 8).join('\n');
+
+  const flat = [];
+  for (const d of range.dates) {
+    for (const s of d.slots || []) {
+      flat.push({ date: d.date, slot: s.slot, label: s.label });
+      if (flat.length >= 10) break;
+    }
+    if (flat.length >= 10) break;
+  }
+  const rows = flat.map(s => ({
+    id: `slot_${service_id}_${s.date}_${s.slot}`,
+    title: `${s.date.slice(5)} ${s.label}`.slice(0, 24),
   }));
+
   return {
     type: 'send_slot_list',
-    bodyText: `Pick a time for ${service_title || 'your appointment'} on ${date}:`,
+    bodyText:
+      `Here’s availability for *${service_title || 'your appointment'}* (next ${range.days} days):\n\n${summary}` +
+      (lines.length > 8 ? `\n\n…tap below to pick a time (first ${flat.length} options shown).` : '\n\nTap a time below.'),
     buttonText: 'Pick a time',
-    sections: [{ title: 'Available times', rows }],
+    sections: [{ title: 'Times', rows }],
   };
 }
 
@@ -1034,7 +1085,7 @@ async function handleBookingIntentFromMessage({ tenantId, subscriptionPlan, defa
   }
 
   const lower = String(message || '').toLowerCase();
-  const pickedService = services.find(s => lower.includes((s.service_title || '').toLowerCase()));
+  const pickedService = pickServiceFromUserMessage(services, message);
   const parsedDate = extractDateFromMessage(message);
 
   if (pickedService && parsedDate) {
@@ -1047,9 +1098,22 @@ async function handleBookingIntentFromMessage({ tenantId, subscriptionPlan, defa
   }
 
   if (pickedService && !parsedDate) {
+    if (isBookingDateOrAvailabilityQuery(message)) {
+      return await handleGetAvailability({
+        tenantId, subscriptionPlan,
+        service_id: pickedService.id,
+        date: null,
+        service_title: pickedService.service_title,
+      });
+    }
+    const price = pickedService.price != null ? `₦${Number(pickedService.price).toLocaleString()}` : '';
+    const dur = pickedService.duration_minutes || 30;
+    const detail = [dur && `${dur} min`, price].filter(Boolean).join(' · ');
     return {
       type: 'replace',
-      text: `Sure — what date would you like for ${pickedService.service_title}? I can then show available time slots.`,
+      text:
+        `For *${pickedService.service_title}*${detail ? ` (${detail})` : ''}:\n\n` +
+        `Tell me which *date* you want (e.g. March 30 or 2026-03-30) and I'll show the available time slots to pick from.`,
     };
   }
 
@@ -1711,7 +1775,54 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
 
 function isBookingIntentMessage(message = '') {
   const m = String(message).toLowerCase();
-  return /\b(book|booking|appointment|schedule|service|services|available date|available dates|time slot|timeslot|slot|slots)\b/.test(m);
+  return /\b(book|booking|appointment|schedule|service|services|available date|available dates|what dates|which dates|time slot|timeslot|slot|slots)\b/.test(m);
+}
+
+/** User is asking for dates/slots/availability — not a generic "list all services". */
+function isBookingDateOrAvailabilityQuery(message = '') {
+  const m = String(message).toLowerCase();
+  return /\b(what dates|which dates|available dates|any dates|open dates|time slot|timeslot|time slots|availability|when can i|openings?|open slot|schedule)\b/.test(m);
+}
+
+/**
+ * "I'd like to book [X]" / "dates for [X] service" — prefer booking handler over full service dump.
+ */
+function shouldRouteListServicesToBooking(message = '') {
+  const m = String(message).toLowerCase();
+  return /\b(book|booking|appointment|for your|for the|for my|dates for|availability for)\b/.test(m);
+}
+
+/**
+ * Match user text to a StoreService title (substring, then fuzzy token overlap).
+ */
+function pickServiceFromUserMessage(services, message) {
+  const lower = String(message || '').toLowerCase();
+  if (!services?.length) return null;
+
+  const bySubstring = services.find(s => {
+    const t = (s.service_title || '').toLowerCase().trim();
+    if (!t) return false;
+    if (lower.includes(t)) return true;
+    // "nail test" matches "nail test566" — strip digits from title for loose match
+    const tNoDigits = t.replace(/\d+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (tNoDigits.length > 3 && lower.includes(tNoDigits)) return true;
+    return false;
+  });
+  if (bySubstring) return bySubstring;
+
+  const msgTokens = lower.split(/[^a-z0-9]+/).filter(w => w.length > 2);
+  let best = null;
+  let bestScore = 0;
+  for (const s of services) {
+    const t = (s.service_title || '').toLowerCase();
+    const titleTokens = t.split(/[^a-z0-9]+/).filter(w => w.length > 2);
+    const overlap = msgTokens.filter(w => titleTokens.some(tt => tt.includes(w) || w.includes(tt))).length;
+    if (overlap > bestScore) {
+      bestScore = overlap;
+      best = s;
+    }
+  }
+  return bestScore >= 2 ? best : null;
 }
 
 function extractDateFromMessage(message = '') {
