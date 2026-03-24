@@ -116,10 +116,16 @@ async function processMessage(messageData) {
     // ── Store owner button reply (Approve / Decline) ─────────────────────
     // When the store owner taps a button on the receipt notification,
     // handle it here and do NOT run the normal AI flow.
+    // Booking buttons (bapprove_/bdecline_) are handled first; order buttons (approve_/decline_) second.
     if (buttonReply) {
-      await handleOwnerButtonReply({
+      const handledAsBooking = await handleBookingOwnerButtonReply({
         buttonReply, tenantId, phoneNumberId, accessToken,
       });
+      if (!handledAsBooking) {
+        await handleOwnerButtonReply({
+          buttonReply, tenantId, phoneNumberId, accessToken,
+        });
+      }
       return;
     }
 
@@ -151,10 +157,53 @@ async function processMessage(messageData) {
     // ── Booking: user selected a time slot from interactive list ─────────
     // listReply.id format: slot_<serviceId>_<date>_<time> e.g. slot_5_2025-03-09_09:00
     if (listReply?.id && String(listReply.id).startsWith('slot_')) {
-      await handleBookingSlotSelection({
+      // Extract any saved customer name/phone from Firestore state for re-use
+      const savedCustomerName  = pendingOrder?.customer_name  || null;
+      const savedCustomerPhone = pendingOrder?.customer_phone || null;
+      const slotResult = await handleBookingSlotSelection({
         listReply, tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken,
         storeName: storeNameResolved,
+        savedCustomerName, savedCustomerPhone,
       });
+      if (slotResult?.pendingBookingSlot) {
+        // Customer details not yet collected — save state and wait for their reply
+        firestore.saveOrderState?.(tenantId, customerPhone, {
+          state: 'booking_collecting_details',
+          pending_order: {
+            pending_slot: slotResult.pendingBookingSlot,
+            customer_name:  savedCustomerName,
+            customer_phone: savedCustomerPhone,
+          },
+        }).catch(() => {});
+      } else if (slotResult?.bookingId) {
+        // Booking was created right away (customer info was already known) — send payment instructions
+        const payInstructions = buildPaymentInstructions({
+          paymentInstructionType, paypalEmail,
+          bankAccountName, bankName, bankAccountNumber,
+          paymentInstructions, total: null, paymentLink: null,
+        });
+        const confirmMsg = [
+          `✅ *Booking Confirmed!*`,
+          ``,
+          `Service: *${slotResult.serviceTitle}*`,
+          `Date & Time: *${slotResult.dateStr} at ${slotResult.timeLabel}*`,
+          ``,
+          payInstructions,
+          ``,
+          `Once you've paid, *send me a photo of your receipt* and I'll notify the store right away. 📸`,
+        ].join('\n');
+        await safeSend(phoneNumberId, customerPhone, accessToken, confirmMsg);
+        firestore.saveOrderState?.(tenantId, customerPhone, {
+          state: 'booking_awaiting_payment',
+          pending_order: {
+            booking_id:    slotResult.bookingId,
+            service_title: slotResult.serviceTitle,
+            scheduled_at:  slotResult.scheduledAt,
+            customer_name:  savedCustomerName,
+            customer_phone: savedCustomerPhone || customerPhone,
+          },
+        }).catch(() => {});
+      }
       return;
     }
 
@@ -212,6 +261,84 @@ async function processMessage(messageData) {
           return;
         }
 
+    // If in booking_pending_approval state and customer texts, reassure them
+    if (orderState === 'booking_pending_approval' && !incomingImageData) {
+      const svcTitle = pendingOrder?.service_title || 'your appointment';
+      await safeSend(phoneNumberId, customerPhone, accessToken,
+        `Your receipt for the ${svcTitle} booking has been received and is being reviewed. ` +
+        `You'll get a confirmation here once the store approves it. 🙏`
+      );
+      return;
+    }
+
+    // ── Booking customer details collection ──────────────────────────────
+    // When customer is in 'booking_collecting_details' state, they just picked a slot
+    // and we asked for their name + phone. Parse their reply and complete the booking.
+    if (orderState === 'booking_collecting_details' && !incomingImageData && !buttonReply && !listReply) {
+      const slot = pendingOrder?.pending_slot;
+      if (slot) {
+        // Extract name and phone from the message using a simple heuristic
+        const phoneMatch = msgText.match(/\b(0\d{10}|\+\d{10,14})\b/);
+        const extractedPhone = phoneMatch ? phoneMatch[0] : null;
+        // Name = everything before the phone number, trimmed
+        const extractedName = extractedPhone
+          ? msgText.replace(phoneMatch[0], '').replace(/[,\s]+/g, ' ').trim()
+          : msgText.trim();
+
+        if (extractedName && extractedPhone) {
+          log('booking-details', `Got name="${extractedName}" phone="${extractedPhone}" for slot ${slot.scheduled_at}`);
+          // Complete the booking
+          const bookResult = await _completeBookingSlot({
+            tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken,
+            serviceId: slot.service_id,
+            scheduledAt: slot.scheduled_at,
+            dateStr: slot.date,
+            timeLabel: slot.time,
+            customerName: extractedName,
+            customerPhone: extractedPhone,
+          });
+
+          if (bookResult) {
+            // Send payment instructions
+            const payInstructions = buildPaymentInstructions({
+              paymentInstructionType, paypalEmail,
+              bankAccountName, bankName, bankAccountNumber,
+              paymentInstructions, total: null, paymentLink: null,
+            });
+            const confirmMsg = [
+              `✅ *Booking Confirmed!*`,
+              ``,
+              `Service: *${bookResult.serviceTitle}*`,
+              `Date & Time: *${bookResult.dateStr} at ${bookResult.timeLabel}*`,
+              ``,
+              payInstructions,
+              ``,
+              `Once you've paid, *send me a photo of your receipt* and I'll notify the store right away. 📸`,
+            ].join('\n');
+            await safeSend(phoneNumberId, customerPhone, accessToken, confirmMsg);
+            // Save booking_awaiting_payment state
+            firestore.saveOrderState?.(tenantId, customerPhone, {
+              state: 'booking_awaiting_payment',
+              pending_order: {
+                booking_id: bookResult.bookingId,
+                service_title: bookResult.serviceTitle,
+                scheduled_at: bookResult.scheduledAt,
+                customer_name: extractedName,
+                customer_phone: extractedPhone,
+              },
+            }).catch(() => {});
+          }
+          return;
+        } else {
+          // Couldn't parse — ask again naturally
+          await safeSend(phoneNumberId, customerPhone, accessToken,
+            `I just need your full name and phone number (e.g. "Tunde 08031234567") and we're all set.`
+          );
+          return;
+        }
+      }
+    }
+
     // ── Receipt intercept ────────────────────────────────────────────────
     // Fires when customer sends an image that is a payment receipt.
     //
@@ -225,6 +352,21 @@ async function processMessage(messageData) {
     //   - Customer has multiple pending orders simultaneously
     //   - Firestore state was overwritten by a newer order
     //   - Customer's state is pending_approval for one order but they're paying for another
+
+    // ── Booking receipt intercept ────────────────────────────────────────
+    // Fires when customer in 'booking_awaiting_payment' sends an image.
+    if (orderState === 'booking_awaiting_payment' && incomingImageData && pendingOrder?.booking_id) {
+      await handleBookingReceiptSubmission({
+        tenantId, customerPhone, phoneNumberId, accessToken,
+        pendingBooking: pendingOrder, incomingImageData,
+        ownerWhatsappNumber, storeNameResolved,
+      });
+      firestore.saveOrderState?.(tenantId, customerPhone, {
+        state: 'booking_pending_approval',
+        pending_order: pendingOrder,
+      }).catch(() => {});
+      return;
+    }
 
     const isReceiptByState  = orderState === 'awaiting_payment' && incomingImageData && pendingOrder?.order_id;
     const isReceiptByQuote  = incomingImageData && quotedMessageId; // resolve order from quoted msg
@@ -439,9 +581,9 @@ async function processMessage(messageData) {
         finalReply = result.text || finalReply;
         if (result.new_order_state)   newOrderState = result.new_order_state;
         if (result.new_pending_order) newPending    = result.new_pending_order;
-        // Order confirmation is the final word — stop processing other actions.
+        // Order/booking confirmation is the final word — stop processing other actions.
         // Prevents Gemini's co-emitted list_inventory from dumping random product images.
-        if (result.new_order_state === 'awaiting_payment') break;
+        if (result.new_order_state === 'awaiting_payment' || result.new_order_state === 'booking_awaiting_payment') break;
 
       } else if (result.type === 'soft_replace') {
         // Soft replace — only overwrite if Gemini wrote a placeholder, not a real answer
@@ -819,6 +961,160 @@ async function handleOwnerButtonReply({ buttonReply, tenantId, phoneNumberId, ac
   log('done', `Customer notified, state → ${newState}`);
 }
 
+// ── Booking receipt submission ────────────────────────────────────────────────
+// Called when a customer in 'booking_awaiting_payment' sends an image receipt.
+// Attaches the receipt via the new endpoint, then notifies the store owner.
+async function handleBookingReceiptSubmission({
+  tenantId, customerPhone, phoneNumberId, accessToken,
+  pendingBooking, incomingImageData,
+  ownerWhatsappNumber, storeNameResolved,
+}) {
+  const log = (tag, ...a) => console.log(`[booking-receipt:${tag}]`, ...a);
+
+  const bookingId = pendingBooking?.booking_id;
+  if (!bookingId) {
+    log('error', 'No booking_id in pending booking state');
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone,
+      "I couldn't find a booking to attach your receipt to. Please contact the store directly.", null
+    );
+    return;
+  }
+
+  log('attach', `booking ${bookingId}`);
+  const attached = await backendApi.attachBookingReceipt(tenantId, bookingId, incomingImageData.base64)
+    .catch(e => { console.error('[booking-receipt] attachBookingReceipt failed:', e.message); return null; });
+
+  if (!attached) {
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone,
+      "I couldn't process your receipt right now. Please try again or contact the store.", null
+    );
+    return;
+  }
+  log('attached', 'receipt saved to booking');
+
+  // Tell customer receipt was received
+  const serviceTitle = pendingBooking?.service_title || 'your appointment';
+  await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone,
+    `✅ Receipt received for your ${serviceTitle} booking!\n\nThe store is reviewing your payment and will confirm shortly. I'll let you know once it's approved. 🙏`,
+    null
+  );
+
+  // Notify store owner with Approve/Decline buttons
+  if (!ownerWhatsappNumber) {
+    log('owner', 'no owner_whatsapp_number — skipping owner notification');
+    return;
+  }
+
+  const ownerPhone = ownerWhatsappNumber.replace(/[+\s]/g, '');
+  const ownerBody = [
+    `💰 *Booking Payment Receipt — ${storeNameResolved}*`,
+    ``,
+    `Service: *${serviceTitle}*`,
+    `Booking ID: *#${bookingId}*`,
+    `Scheduled: ${pendingBooking?.scheduled_at || 'N/A'}`,
+    `Customer: ${pendingBooking?.customer_name || 'Unknown'} (${customerPhone})`,
+    ``,
+    `Customer has sent a payment receipt. Approve or decline below.`,
+  ].join('\n');
+
+  const btnApprove = `bapprove_${bookingId}_${customerPhone}`;
+  const btnDecline = `bdecline_${bookingId}_${customerPhone}`;
+
+  const ownerSendResult = await whatsapp.sendInteractiveButtons(
+    phoneNumberId, accessToken, ownerPhone,
+    ownerBody,
+    [
+      { id: btnApprove, title: '✅ Approve' },
+      { id: btnDecline, title: '❌ Decline' },
+    ],
+    `Booking #${bookingId}`,
+    `Reply within 24hrs • ${storeNameResolved}`
+  ).catch(e => {
+    console.error('[booking-receipt] owner interactive notification failed:', e.message);
+    return null;
+  });
+
+  if (!ownerSendResult?.success) {
+    await whatsapp.sendMessage(
+      phoneNumberId, accessToken, ownerPhone,
+      `${ownerBody}\n\nReview in your dashboard to approve or decline.`,
+      null
+    ).catch(e => console.error('[booking-receipt] owner text fallback failed:', e.message));
+  }
+
+  log('owner', 'notification sent');
+}
+
+// ── Booking owner button reply ────────────────────────────────────────────────
+// Called when store owner taps Approve/Decline on a booking payment notification.
+// Button ID format: "bapprove_{bookingId}_{customerPhone}" or "bdecline_{...}"
+async function handleBookingOwnerButtonReply({ buttonReply, tenantId, phoneNumberId, accessToken }) {
+  const log = (tag, ...a) => console.log(`[booking-owner-btn:${tag}]`, ...a);
+
+  const parts = (buttonReply.id || '').split('_');
+  // bapprove_<bookingId>_<phone>  →  ['bapprove', bookingId, ...phone]
+  if (parts.length < 3 || !['bapprove', 'bdecline'].includes(parts[0])) {
+    return false; // not a booking button — let caller handle
+  }
+
+  const rawAction  = parts[0];                           // 'bapprove' | 'bdecline'
+  const action     = rawAction === 'bapprove' ? 'approve' : 'decline';
+  const bookingId  = parseInt(parts[1], 10);
+  const customerPhone = parts.slice(2).join('_');
+
+  if (!bookingId) {
+    log('skip', `Invalid bookingId: ${bookingId}`);
+    return true; // consumed
+  }
+
+  log('action', `${action} booking ${bookingId} for customer ${customerPhone}`);
+
+  // 1. Call the confirm-booking-payment endpoint
+  let confirmResult;
+  try {
+    confirmResult = await backendApi.confirmBookingPayment(tenantId, bookingId, action);
+  } catch (e) {
+    console.error('[booking-owner-btn] confirmBookingPayment failed:', e.message);
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone,
+      `Couldn't ${action} the booking right now. Please try again from your dashboard.`, null
+    ).catch(() => {});
+    return true;
+  }
+
+  // 2. Notify customer of the outcome
+  let customerMsg;
+  if (action === 'approve') {
+    customerMsg = [
+      `🎉 Great news! Your payment for booking *#${bookingId}* has been confirmed.`,
+      ``,
+      `Your appointment is all set. We'll see you then. 🙏`,
+    ].join('\n');
+  } else {
+    customerMsg = [
+      `Hi, regarding your booking *#${bookingId}*:`,
+      ``,
+      `We couldn't verify your payment receipt. This could be because:`,
+      `• The receipt was unclear or incomplete`,
+      `• The payment amount didn't match`,
+      ``,
+      `Please resend a clear photo of your payment receipt, or contact us directly for help.`,
+    ].join('\n');
+  }
+
+  await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, customerMsg, null)
+    .catch(e => console.error('[booking-owner-btn] customer notify failed:', e.message));
+
+  // 3. Update Firestore state
+  const newState = action === 'approve' ? 'booking_complete' : 'booking_awaiting_payment';
+  firestore.saveOrderState?.(tenantId, customerPhone, {
+    state: newState,
+    pending_order: action === 'decline' ? { booking_id: bookingId } : null,
+  }).catch(() => {});
+
+  log('done', `Customer notified, booking state → ${newState}`);
+  return true; // consumed
+}
+
 // ── Booking: user picked a date → show time list for that day ───────────────────
 // listReply.id = pickdate_<serviceId>_<YYYYMMDD> (no dashes in date part)
 async function handleBookingDateSelection({
@@ -863,42 +1159,79 @@ async function handleBookingDateSelection({
 
 // ── Booking: user tapped a time slot from the interactive list ─────────────────
 // listReply.id = slot_<serviceId>_YYYY-MM-DD_<HH:mm> (date contains dashes — use regex)
+// Instead of booking immediately, we save the pending slot and ask for customer details.
 async function handleBookingSlotSelection({
-  listReply, tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken, storeName
+  listReply, tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken, storeName,
+  savedCustomerName, savedCustomerPhone,
 }) {
   const log = (tag, ...a) => console.log(`[booking-slot:${tag}]`, ...a);
   const id = String(listReply.id || '');
   const m = id.match(/^slot_(\d+)_(\d{4}-\d{2}-\d{2})_(.+)$/);
   if (!m) {
     log('skip', 'invalid slot id:', listReply.id);
-    return;
+    return null;
   }
   const serviceId = parseInt(m[1], 10);
   const dateStr = m[2];
   const timeStr = m[3];
   if (!serviceId || !dateStr || !timeStr) {
     log('skip', 'missing service/date/time');
-    return;
+    return null;
   }
   const hm = /^\d{1,2}:\d{2}$/.test(timeStr) ? timeStr : `${timeStr.slice(0, 2)}:${timeStr.slice(2, 4)}`;
   const scheduledAt = `${dateStr}T${hm}:00`;
+  const timeLabel = (listReply.title && /[\d:]+/.test(listReply.title)) ? listReply.title : timeStr;
+
+  // If we already have the customer name and phone from earlier in the conversation, book right away.
+  if (savedCustomerName && savedCustomerPhone) {
+    log('book', `Using saved customer info: ${savedCustomerName} / ${savedCustomerPhone}`);
+    return await _completeBookingSlot({
+      tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken,
+      serviceId, scheduledAt, dateStr, timeLabel,
+      customerName: savedCustomerName, customerPhone: savedCustomerPhone,
+    });
+  }
+
+  // No customer info yet — save the pending slot in a return value so the caller
+  // can persist it to Firestore and ask for details.
+  log('pending', `Slot selected ${scheduledAt} — asking for customer details`);
+  await whatsapp.sendMessage(
+    phoneNumberId, accessToken, customerPhone,
+    `Almost done — what\'s your name and best phone number for the booking?`,
+    null
+  ).catch(() => {});
+
+  // Return the pending booking data so processMessage can save it to Firestore
+  return {
+    pendingBookingSlot: { service_id: serviceId, scheduled_at: scheduledAt, date: dateStr, time: timeLabel },
+  };
+}
+
+// Complete the booking after customer details are confirmed
+async function _completeBookingSlot({
+  tenantId, subscriptionPlan, customerPhone, phoneNumberId, accessToken,
+  serviceId, scheduledAt, dateStr, timeLabel, customerName, customerPhone: custPhone,
+}) {
+  const log = (tag, ...a) => console.log(`[booking-complete:${tag}]`, ...a);
   try {
-    await backendApi.createBooking(tenantId, {
+    const data = await backendApi.createBooking(tenantId, {
       service_id: serviceId,
       scheduled_at: scheduledAt,
-      customer_name: 'WhatsApp Customer',
-      customer_phone: customerPhone,
-      subscription_plan: subscriptionPlan
+      customer_name: customerName,
+      customer_phone: custPhone,
+      subscription_plan: subscriptionPlan,
     });
-    const timeLabel = (listReply.title && /[\d:]+/.test(listReply.title)) ? listReply.title : timeStr;
-    const msg = `You're all set. Your appointment is confirmed for ${dateStr} at ${timeLabel}. We'll see you then.`;
-    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone, msg, null);
-    log('done', `Booking created for ${scheduledAt}`);
+    const booking = data?.data?.booking;
+    const bookingId = booking?.id;
+    const serviceTitle = booking?.service_title || 'your appointment';
+    log('done', `Booking ${bookingId} created for ${scheduledAt}`);
+    return { bookingId, serviceTitle, scheduledAt, dateStr, timeLabel };
   } catch (e) {
-    console.error('[booking-slot] createBooking failed:', e.message);
+    console.error('[booking-complete] createBooking failed:', e.message);
     await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone,
-      "We couldn't complete the booking right now. Please try again or contact the store directly.", null
+      "We couldn\'t complete the booking right now. Please try again or contact the store directly.", null
     ).catch(() => {});
+    return null;
   }
 }
 
@@ -950,6 +1283,9 @@ async function handleAction(action, ctx) {
           customer_name: action.customer_name,
           customer_phone: action.customer_phone || customerPhone,
           customer_email: action.customer_email,
+          // Payment config so booking confirmation includes payment instructions
+          paymentInstructionType, paypalEmail,
+          bankAccountName, bankName, bankAccountNumber, paymentInstructions,
         });
 
       case 'list_inventory':
@@ -1299,6 +1635,7 @@ async function handleGetAvailability({ tenantId, subscriptionPlan, service_id, d
 async function handleBookService({
   tenantId, subscriptionPlan, customerPhone,
   service_id, scheduled_at, customer_name, customer_phone, customer_email,
+  paymentInstructionType, paypalEmail, bankAccountName, bankName, bankAccountNumber, paymentInstructions,
 }) {
   if (!service_id || !scheduled_at || !customer_name || !customer_phone) return null;
   try {
@@ -1311,12 +1648,40 @@ async function handleBookService({
       subscription_plan: subscriptionPlan,
     });
     const b = data?.data?.booking;
+    const bookingId   = b?.id;
+    const serviceTitle = b?.service_title || 'your appointment';
     const at = b?.scheduled_at ? new Date(b.scheduled_at) : null;
     const timeStr = at ? at.toLocaleTimeString('en-NG', { hour: 'numeric', minute: '2-digit' }) : scheduled_at;
     const dateStr = at ? at.toLocaleDateString('en-NG') : scheduled_at;
+
+    const payInstructions = buildPaymentInstructions({
+      paymentInstructionType, paypalEmail,
+      bankAccountName, bankName, bankAccountNumber,
+      paymentInstructions, total: null, paymentLink: null,
+    });
+
+    const confirmMsg = [
+      `✅ *Booking Confirmed!*`,
+      ``,
+      `Service: *${serviceTitle}*`,
+      `Date & Time: *${dateStr} at ${timeStr}*`,
+      ``,
+      payInstructions,
+      ``,
+      `Once you've paid, *send me a photo of your receipt* and I'll notify the store right away. 📸`,
+    ].join('\n');
+
     return {
       type: 'replace',
-      text: `You're all set. Your appointment for ${data?.data?.booking?.service_title || 'your service'} is confirmed for ${dateStr} at ${timeStr}. We'll see you then.`,
+      text: confirmMsg,
+      new_order_state: 'booking_awaiting_payment',
+      new_pending_order: {
+        booking_id:    bookingId,
+        service_title: serviceTitle,
+        scheduled_at:  scheduled_at,
+        customer_name:  customer_name,
+        customer_phone: customer_phone || customerPhone,
+      },
     };
   } catch (e) {
     console.error('[book_service] createBooking failed:', e.message);
