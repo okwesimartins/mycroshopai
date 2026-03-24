@@ -129,6 +129,17 @@ async function processMessage(messageData) {
       return;
     }
 
+    // ── Receipt order selection (list row) ──────────────────────────────────
+    // Customer picked which order their previously-sent receipt image belongs to.
+    // listReply.id format: receiptorder_<orderId>_<customerPhone>
+    if (listReply?.id && String(listReply.id).startsWith('receiptorder_')) {
+      await handleReceiptOrderSelection({
+        listReply, tenantId, customerPhone, phoneNumberId, accessToken,
+        savedOrderState, ownerWhatsappNumber, storeNameResolved,
+      });
+      return;
+    }
+
     // ── Booking: "More dates" pagination (list row) ─────────────────────────
     if (listReply?.id && String(listReply.id).startsWith('moredates_')) {
       await handleBookingMoreDatesList({
@@ -249,23 +260,27 @@ async function processMessage(messageData) {
     let orderState   = 'idle';
     let pendingOrder = null;
     if (savedOrderState) { orderState = savedOrderState.state || 'idle'; pendingOrder = savedOrderState.pending_order || null; }
-    // If in pending_approval state and customer sends any text, reassure them
-    if (orderState === 'pending_approval' && !incomingImageData) {
-      const orderNum = pendingOrder?.order_number || '';
-      await safeSend(phoneNumberId, customerPhone, accessToken,
-        `Your receipt for Order ${orderNum} has been received and is being reviewed by the store. ` +
-        `You'll get a notification here as soon as it's confirmed.\n\n` +
-        `Before we proceed with another product enquiry or new purchase, this order needs to be confirmed first so we don't mix payments. Thanks for your patience. 🙏`
-          );
-          return;
-        }
-
+    // ── pending_approval: customer CAN still browse/order ──────────────────────
+    // We removed the hard block here. Customers in pending_approval state are now
+    // free to browse products and place new orders while waiting for receipt confirmation.
+    // If they send another receipt image, the multi-order disambiguation flow below
+    // will show them a list of their unconfirmed orders to link it to.
     // If in booking_pending_approval state and customer texts, reassure them
     if (orderState === 'booking_pending_approval' && !incomingImageData) {
       const svcTitle = pendingOrder?.service_title || 'your appointment';
       await safeSend(phoneNumberId, customerPhone, accessToken,
         `Your receipt for the ${svcTitle} booking has been received and is being reviewed. ` +
         `You'll get a confirmation here once the store approves it. 🙏`
+      );
+      return;
+    }
+
+    // ── Receipt: customer sent text while waiting to select an order ────────
+    // They're in 'receipt_pending_order_selection' — they need to tap the list,
+    // not type. Nudge them so they don't get confused.
+    if (orderState === 'receipt_pending_order_selection' && !incomingImageData && !listReply) {
+      await safeSend(phoneNumberId, customerPhone, accessToken,
+        `Please tap the order list I sent to select which order your receipt belongs to. If you can't see it, let me know and I'll resend it.`
       );
       return;
     }
@@ -367,7 +382,73 @@ async function processMessage(messageData) {
 
     const isReceiptByState  = orderState === 'awaiting_payment' && incomingImageData && pendingOrder?.order_id;
     const isReceiptByQuote  = incomingImageData && quotedMessageId; // resolve order from quoted msg
+    // Also intercept images when customer is in pending_approval (already submitted one receipt)
+    // or when they have no order state but still send an image that might be a receipt.
+    const isPossibleReceipt = incomingImageData && (
+      isReceiptByState ||
+      isReceiptByQuote ||
+      orderState === 'pending_approval' ||
+      orderState === 'awaiting_payment'
+    );
     const isReceiptMessage  = isReceiptByState || isReceiptByQuote;
+
+    // ── Multi-order receipt disambiguation ───────────────────────────────────
+    // When the customer sends a receipt image and may have multiple unconfirmed orders,
+    // we fetch ALL their pending/awaiting-payment orders.
+    //   • 1 order  → attach directly (existing behaviour, no list needed)
+    //   • 2+ orders → show an interactive list so customer picks which order the receipt is for
+    // This fires when: state=awaiting_payment, state=pending_approval, or any image send
+    // where we don't already know the exact order from a quoted message.
+    if (incomingImageData && !quotedMessageId) {
+      const allPending = await backendApi.getAllPendingOrdersByPhone(tenantId, customerPhone)
+        .catch(() => []);
+
+      if (allPending.length >= 2) {
+        // Multiple unconfirmed orders — save the receipt image in Firestore state and
+        // ask the customer which order it belongs to via an interactive list.
+        log('receipt-disambig', `${allPending.length} pending orders found — showing order picker`);
+
+        // Persist the receipt image temporarily so we can use it after selection
+        firestore.saveOrderState?.(tenantId, customerPhone, {
+          state: 'receipt_pending_order_selection',
+          pending_order: {
+            ...(pendingOrder || {}),
+            // Store the receipt image temporarily for use after order selection
+            pending_receipt_base64: incomingImageData.base64,
+            pending_receipt_mime:   incomingImageData.mimeType,
+          },
+        }).catch(() => {});
+
+        // Build WhatsApp interactive list rows — one per unconfirmed order
+        const rows = allPending.slice(0, 10).map(o => {
+          const num    = o.order_number || `#${o.id}`;
+          const items  = (o.OnlineStoreOrderItems || o.items || []);
+          const desc   = items.length
+            ? items.slice(0, 2).map(i => i.product_name || i.name).join(', ') + (items.length > 2 ? '…' : '')
+            : 'Order';
+          const total  = o.total ? ` — ₦${Number(o.total).toLocaleString()}` : '';
+          return {
+            id:          `receiptorder_${o.id}_${customerPhone}`,
+            title:       String(`Order ${num}`).slice(0, 24),
+            description: String(`${desc}${total}`).slice(0, 72),
+          };
+        });
+
+        // Acknowledge receipt + ask for order selection
+        await safeSend(phoneNumberId, customerPhone, accessToken,
+          `Got your receipt. 📸 You have ${allPending.length} orders awaiting confirmation — which one is this payment for?`
+        );
+        await whatsapp.sendInteractiveList(
+          phoneNumberId, accessToken, customerPhone,
+          'Tap the button below and select the order this receipt is for:',
+          'Select Order',
+          [{ title: 'Your Pending Orders', rows }]
+        ).catch(e => logErr('receipt-order-list', e));
+        return;
+      }
+
+      // Only 0 or 1 pending order — fall through to the normal receipt flow
+    }
 
     if (isReceiptMessage) {
       // For quote-based receipts, we may not have pendingOrder yet — create a minimal placeholder
@@ -903,6 +984,149 @@ async function handleReceiptSubmission({
 
   log('owner', 'notification flow complete');
 }
+
+// ── Receipt order selection handler ──────────────────────────────────────────
+// Called when customer taps a row in the "which order is this receipt for?" list.
+// Retrieves the saved receipt image from Firestore state, attaches it to the chosen
+// order, then notifies the store owner with Approve/Decline buttons.
+//
+// listReply.id format: "receiptorder_{orderId}_{customerPhone}"
+async function handleReceiptOrderSelection({
+  listReply, tenantId, customerPhone, phoneNumberId, accessToken,
+  savedOrderState, ownerWhatsappNumber, storeNameResolved,
+}) {
+  const log = (tag, ...a) => console.log(`[receipt-select:${tag}]`, ...a);
+
+  // Parse the order ID from the list reply
+  const parts = String(listReply.id || '').split('_');
+  // Format: receiptorder_<orderId>_<phone>  (phone may contain underscores)
+  if (parts.length < 3 || parts[0] !== 'receiptorder') {
+    log('skip', `Unrecognised list reply id: ${listReply.id}`);
+    return;
+  }
+  const orderId     = parseInt(parts[1], 10);
+  const orderNumber = listReply.title || `#${orderId}`;
+
+  if (!orderId) {
+    log('skip', `Invalid orderId parsed from: ${listReply.id}`);
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone,
+      "Something went wrong identifying that order. Please try again or contact the store.", null
+    ).catch(() => {});
+    return;
+  }
+
+  log('selected', `Customer chose order ${orderId} (${orderNumber})`);
+
+  // Retrieve the saved receipt image from Firestore order state
+  const pendingReceipt = savedOrderState?.pending_order;
+  const receiptBase64  = pendingReceipt?.pending_receipt_base64 || null;
+  const receiptMime    = pendingReceipt?.pending_receipt_mime   || 'image/jpeg';
+
+  if (!receiptBase64) {
+    log('error', 'No saved receipt image found in Firestore state');
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone,
+      "I couldn't find your receipt image — it may have expired. Please send the receipt photo again and I'll link it to the right order.", null
+    ).catch(() => {});
+    // Clear the stale selection state
+    firestore.saveOrderState?.(tenantId, customerPhone, { state: 'idle', pending_order: null }).catch(() => {});
+    return;
+  }
+
+  // 1. Attach the receipt to the selected order
+  log('attach', `Attaching receipt to order ${orderId}`);
+  const attached = await backendApi.attachOrderReceipt(tenantId, orderId, {
+    receipt_image_base64: receiptBase64,
+    mime_type:            receiptMime,
+  }).catch(e => { console.error('[receipt-select] attachOrderReceipt failed:', e.message); return null; });
+
+  if (!attached) {
+    await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone,
+      "I couldn't attach your receipt right now. Please try sending the photo again.", null
+    ).catch(() => {});
+    return;
+  }
+  log('attached', `Receipt saved to order ${orderId}`);
+
+  // 2. Confirm to the customer
+  await whatsapp.sendMessage(phoneNumberId, accessToken, customerPhone,
+    `✅ Got it! Your receipt has been linked to *${orderNumber}*.
+
+The store is reviewing your payment and will confirm shortly. I'll let you know as soon as it's approved. 🙏`,
+    null
+  ).catch(() => {});
+
+  // 3. Update Firestore — order is now pending_approval, clear the receipt buffer
+  firestore.saveOrderState?.(tenantId, customerPhone, {
+    state: 'pending_approval',
+    pending_order: {
+      order_id:     orderId,
+      order_number: orderNumber,
+    },
+  }).catch(() => {});
+
+  // 4. Notify the store owner with Approve / Decline buttons
+  if (!ownerWhatsappNumber) {
+    console.error(
+      `[receipt-select:owner] MISSING owner_whatsapp_number for tenant ${tenantId}. ` +
+      `Receipt for order ${orderNumber} attached but owner NOT notified.`
+    );
+    return;
+  }
+
+  const ownerPhone = ownerWhatsappNumber.replace(/[+\s]/g, '');
+  if (!ownerPhone) {
+    console.error(`[receipt-select:owner] owner_whatsapp_number is blank for tenant ${tenantId}.`);
+    return;
+  }
+
+  const ownerBody = [
+    `💰 *Payment Receipt — ${storeNameResolved}*`,
+    ``,
+    `Order: *${orderNumber}*`,
+    `Customer: ${customerPhone}`,
+    ``,
+    `Customer has sent a payment receipt and confirmed it belongs to this order.`,
+    `Approve or decline below.`,
+  ].join('\n');
+
+  const btnApprove = `approve_${orderId}_${customerPhone}`;
+  const btnDecline = `decline_${orderId}_${customerPhone}`;
+
+  log('owner', `Sending approval request to ${ownerPhone}`);
+  const ownerResult = await whatsapp.sendInteractiveButtons(
+    phoneNumberId, accessToken, ownerPhone,
+    ownerBody,
+    [
+      { id: btnApprove, title: '✅ Approve' },
+      { id: btnDecline, title: '❌ Decline' },
+    ],
+    `Order ${orderNumber}`,
+    `Reply within 24hrs • ${storeNameResolved}`
+  ).catch(e => {
+    console.error('[receipt-select:owner] interactive buttons failed:', e.message);
+    return null;
+  });
+
+  if (ownerResult?.success) {
+    log('owner', `Approval request sent (msgId: ${ownerResult.messageId})`);
+  } else {
+    // Fallback to plain text
+    console.warn(`[receipt-select:owner] Buttons failed — falling back to plain text for ${ownerPhone}`);
+    await whatsapp.sendMessage(
+      phoneNumberId, accessToken, ownerPhone,
+      `${ownerBody}
+
+To approve: reply APPROVE ${orderId}
+To decline: reply DECLINE ${orderId}
+
+Or use your dashboard to approve/decline.`,
+      null
+    ).catch(e => console.error('[receipt-select:owner] text fallback failed:', e.message));
+  }
+
+  log('done', `Receipt selection flow complete for order ${orderId}`);
+}
+
 
 // ── Owner button reply handler ─────────────────────────────────────────────────
 // Called at the TOP of processMessage when a buttonReply is detected.
