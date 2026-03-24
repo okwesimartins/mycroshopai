@@ -177,25 +177,24 @@ async function processMessage(messageData) {
         }).catch(() => {});
       } else if (slotResult?.bookingId) {
         // Booking was created right away (customer info was already known) — send payment instructions
-        const payInstructions = buildPaymentInstructions({
+        const bookMsg = await buildBookingPaymentMessage({
+          tenantId, bookingId: slotResult.bookingId,
+          serviceTitle: slotResult.serviceTitle,
+          scheduledAt: slotResult.scheduledAt,
+          dateLabel: slotResult.dateStr,
+          timeLabel: slotResult.timeLabel,
+          customerName:  savedCustomerName,
+          customerPhone: savedCustomerPhone || customerPhone,
+          customerEmail: null,
+          service_id: null,
           paymentInstructionType, paypalEmail,
-          bankAccountName, bankName, bankAccountNumber,
-          paymentInstructions, total: null, paymentLink: null,
+          bankAccountName, bankName, bankAccountNumber, paymentInstructions,
+          bookingData: null,
         });
-        const confirmMsg = [
-          `✅ *Booking Confirmed!*`,
-          ``,
-          `Service: *${slotResult.serviceTitle}*`,
-          `Date & Time: *${slotResult.dateStr} at ${slotResult.timeLabel}*`,
-          ``,
-          payInstructions,
-          ``,
-          `Once you've paid, *send me a photo of your receipt* and I'll notify the store right away. 📸`,
-        ].join('\n');
-        await safeSend(phoneNumberId, customerPhone, accessToken, confirmMsg);
+        await safeSend(phoneNumberId, customerPhone, accessToken, bookMsg.text);
         firestore.saveOrderState?.(tenantId, customerPhone, {
-          state: 'booking_awaiting_payment',
-          pending_order: {
+          state: bookMsg.isPaystack ? 'idle' : 'booking_awaiting_payment',
+          pending_order: bookMsg.isPaystack ? null : {
             booking_id:    slotResult.bookingId,
             service_title: slotResult.serviceTitle,
             scheduled_at:  slotResult.scheduledAt,
@@ -299,27 +298,25 @@ async function processMessage(messageData) {
           });
 
           if (bookResult) {
-            // Send payment instructions
-            const payInstructions = buildPaymentInstructions({
+            // Send payment instructions (Paystack link or bank details)
+            const bookMsg = await buildBookingPaymentMessage({
+              tenantId, bookingId: bookResult.bookingId,
+              serviceTitle: bookResult.serviceTitle,
+              scheduledAt: bookResult.scheduledAt,
+              dateLabel: bookResult.dateStr,
+              timeLabel: bookResult.timeLabel,
+              customerName: extractedName,
+              customerPhone: extractedPhone,
+              customerEmail: null,
+              service_id: slot.service_id,
               paymentInstructionType, paypalEmail,
-              bankAccountName, bankName, bankAccountNumber,
-              paymentInstructions, total: null, paymentLink: null,
+              bankAccountName, bankName, bankAccountNumber, paymentInstructions,
+              bookingData: null,
             });
-            const confirmMsg = [
-              `✅ *Booking Confirmed!*`,
-              ``,
-              `Service: *${bookResult.serviceTitle}*`,
-              `Date & Time: *${bookResult.dateStr} at ${bookResult.timeLabel}*`,
-              ``,
-              payInstructions,
-              ``,
-              `Once you've paid, *send me a photo of your receipt* and I'll notify the store right away. 📸`,
-            ].join('\n');
-            await safeSend(phoneNumberId, customerPhone, accessToken, confirmMsg);
-            // Save booking_awaiting_payment state
+            await safeSend(phoneNumberId, customerPhone, accessToken, bookMsg.text);
             firestore.saveOrderState?.(tenantId, customerPhone, {
-              state: 'booking_awaiting_payment',
-              pending_order: {
+              state: bookMsg.isPaystack ? 'idle' : 'booking_awaiting_payment',
+              pending_order: bookMsg.isPaystack ? null : {
                 booking_id: bookResult.bookingId,
                 service_title: bookResult.serviceTitle,
                 scheduled_at: bookResult.scheduledAt,
@@ -634,7 +631,7 @@ async function processMessage(messageData) {
 
     // ── Final cleanup ────────────────────────────────────────────────────
     finalReply = (finalReply || '')
-      .replace(/\b(list_inventory|query_inventory|create_order|check_payment|show_variations|list_services|get_availability|book_service)\b/gi, '')
+      .replace(/\b(list_inventory|query_inventory|create_order|check_payment|show_variations|list_services|get_availability|book_service|request_refund)\b/gi, '')
       .replace(/\n{3,}/g, '\n\n')
       .replace(/ {2,}/g, ' ')
       // Remove exclamation marks — they read as robotic/bot-like, not human
@@ -1354,6 +1351,18 @@ async function handleAction(action, ctx) {
       case 'check_payment':
         return await handlePaymentCheck(tenantId, message);
 
+      case 'request_refund':
+        return await handleRefundRequest({
+          tenantId,
+          customerPhone,
+          customerName:  action.customer_name  || pendingOrder?.customer_name  || null,
+          customerEmail: action.customer_email || pendingOrder?.customer_email || null,
+          orderId:       action.order_id       || pendingOrder?.order_id       || null,
+          receiptId:     action.receipt_id     || null,
+          reason:        action.reason         || null,
+          details:       action.details        || null,
+        });
+
       default:
         console.warn('[handleAction] unknown action:', action.type);
         return null;
@@ -1654,10 +1663,52 @@ async function handleBookService({
     const timeStr = at ? at.toLocaleTimeString('en-NG', { hour: 'numeric', minute: '2-digit' }) : scheduled_at;
     const dateStr = at ? at.toLocaleDateString('en-NG') : scheduled_at;
 
+    const isPaystack = (paymentInstructionType || '').toLowerCase() === 'paystack';
+    let resolvedPaymentLink = null;
+
+    if (isPaystack && bookingId) {
+      const customerEmail = customer_email || `${(customer_phone || customerPhone).replace(/[^\d]/g, '')}@wa.mycroshop.local`;
+      const paymentLinkResult = await backendApi.initializePaymentLink({
+        tenant_id:          tenantId,
+        amount:             b?.price != null ? parseFloat(b.price) : 0,
+        email:              customerEmail,
+        name:               customer_name || 'WhatsApp Customer',
+        currency:           'NGN',
+        customer_phone:     (customer_phone || customerPhone).replace(/[^\d+]/g, ''),
+        whatsapp_message_id: null,
+        metadata: {
+          source:         'whatsapp_ai',
+          channel:        'whatsapp',
+          flow:           'service_booking',
+          tenant_id:      tenantId,
+          booking_id:     bookingId,
+          service_id:     service_id,
+          service_title:  serviceTitle,
+          scheduled_at:   scheduled_at,
+          timezone:       'Africa/Lagos',
+          location_type:  b?.location_type || 'in_person',
+          customer_name:  customer_name || 'WhatsApp Customer',
+          customer_phone: (customer_phone || customerPhone).replace(/[^\d+]/g, ''),
+          customer_email: customer_email || customerEmail,
+          payment_context: {
+            origin:       'ai_sales_agent',
+            initiated_at: new Date().toISOString(),
+          },
+        },
+      }).catch(e => { console.error('[booking] initializePaymentLink failed:', e.message); return null; });
+
+      if (paymentLinkResult?.payment_link) {
+        resolvedPaymentLink = paymentLinkResult.payment_link;
+        console.log(`[booking] Paystack link generated for booking ${bookingId}: ${resolvedPaymentLink}`);
+      } else {
+        console.warn(`[booking] Paystack link generation failed for booking ${bookingId} — falling back`);
+      }
+    }
+
     const payInstructions = buildPaymentInstructions({
       paymentInstructionType, paypalEmail,
       bankAccountName, bankName, bankAccountNumber,
-      paymentInstructions, total: null, paymentLink: null,
+      paymentInstructions, total: null, paymentLink: resolvedPaymentLink,
     });
 
     const confirmMsg = [
@@ -1667,15 +1718,16 @@ async function handleBookService({
       `Date & Time: *${dateStr} at ${timeStr}*`,
       ``,
       payInstructions,
-      ``,
-      `Once you've paid, *send me a photo of your receipt* and I'll notify the store right away. 📸`,
-    ].join('\n');
+      isPaystack ? '' : ``,
+      isPaystack ? '' : `Once you've paid, *send me a photo of your receipt* and I'll notify the store right away. 📸`,
+    ].filter(l => l !== '').join('\n');
 
     return {
       type: 'replace',
       text: confirmMsg,
-      new_order_state: 'booking_awaiting_payment',
-      new_pending_order: {
+      // Paystack: payment handled online — no receipt flow needed
+      new_order_state: isPaystack ? 'idle' : 'booking_awaiting_payment',
+      new_pending_order: isPaystack ? null : {
         booking_id:    bookingId,
         service_title: serviceTitle,
         scheduled_at:  scheduled_at,
@@ -2178,14 +2230,72 @@ async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineSt
   const o = orderResult.order;
   const orderId     = o?.id;
   const orderNumber = o?.order_number || `#${orderId}`;
-  const total       = o?.total != null ? fmtN(o.total) : null;
+  const totalRaw    = o?.total != null ? parseFloat(o.total) : null;
+  const total       = totalRaw != null ? fmtN(totalRaw) : null;
+
+  // ── Paystack: generate a proper payment link with full metadata ──────────────
+  // When merchant has configured Paystack, generate a fresh payment link via the
+  // initialize-payment-link endpoint instead of using the generic order paymentLink.
+  // This embeds all order/item metadata into the Paystack transaction.
+  const isPaystack = (paymentInstructionType || '').toLowerCase() === 'paystack';
+  let resolvedPaymentLink = orderResult.paymentLink || null;
+
+  if (isPaystack && orderId) {
+    const customerEmail = details.customer_email || `${(details.customer_phone || customerPhone).replace(/[^\d]/g, '')}@wa.mycroshop.local`;
+    const amountKobo = totalRaw ? Math.round(totalRaw * 100) : 0; // Paystack uses kobo (smallest unit)
+
+    const paymentLinkResult = await backendApi.initializePaymentLink({
+      tenant_id:          tenantId,
+      amount:             totalRaw || 0,
+      email:              customerEmail,
+      name:               details.customer_name || 'WhatsApp Customer',
+      currency:           'NGN',
+      customer_phone:     (details.customer_phone || customerPhone).replace(/[^\d+]/g, ''),
+      whatsapp_message_id: messageId || null,
+      metadata: {
+        source:           'whatsapp_ai',
+        channel:          'whatsapp',
+        flow:             'product_order',
+        tenant_id:        tenantId,
+        order_id:         orderId,
+        online_store_id:  defaultOnlineStoreId,
+        customer_name:    details.customer_name || 'WhatsApp Customer',
+        customer_phone:   (details.customer_phone || customerPhone).replace(/[^\d+]/g, ''),
+        customer_email:   details.customer_email || customerEmail,
+        shipping_address: details.shipping_address || '',
+        items: validItems.map(i => ({
+          product_id:   i.product_id,
+          product_name: i.product_name,
+          quantity:     i.quantity,
+          unit_price:   i.price,
+          ...(i.variant_id ? { variant_id: i.variant_id } : {}),
+        })),
+        subtotal: totalRaw || 0,
+        delivery_fee: 0,
+        discount: 0,
+        total: totalRaw || 0,
+        payment_context: {
+          origin:              'ai_sales_agent',
+          whatsapp_message_id: messageId || null,
+          initiated_at:        new Date().toISOString(),
+        },
+      },
+    }).catch(e => { console.error('[order] initializePaymentLink failed:', e.message); return null; });
+
+    if (paymentLinkResult?.payment_link) {
+      resolvedPaymentLink = paymentLinkResult.payment_link;
+      console.log(`[order] Paystack link generated for order ${orderId}: ${resolvedPaymentLink}`);
+    } else {
+      console.warn(`[order] Paystack link generation failed for order ${orderId} — falling back to generic link`);
+    }
+  }
 
   // Build payment instructions based on merchant's configured payment method
   const payInstructions = buildPaymentInstructions({
     paymentInstructionType, paypalEmail,
     bankAccountName, bankName, bankAccountNumber,
     paymentInstructions, total,
-    paymentLink: orderResult.paymentLink,
+    paymentLink: resolvedPaymentLink,
   });
 
   // Compose the order confirmation + payment instruction message
@@ -2196,14 +2306,17 @@ async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineSt
   let msg = `✅ Order placed!\n\nOrder ${orderNumber}\n${itemsList}`;
   if (total) msg += `\n\nTotal: *${total}*`;
   msg += `\n\n${payInstructions}`;
-  msg += `\n\nOnce you've paid, *send me a photo of your receipt* and I'll notify the store right away. 📸`;
+  // For bank transfer: ask for receipt. For Paystack: no receipt needed (payment is confirmed automatically).
+  if (!isPaystack) {
+    msg += `\n\nOnce you've paid, *send me a photo of your receipt* and I'll notify the store right away. 📸`;
+  }
 
   return {
     type: 'replace',
     text: msg,
-    // Save order_id so receipt handler knows which order to attach to
-    new_order_state: 'awaiting_payment',
-    new_pending_order: {
+    // For Paystack: payment is handled online — no receipt needed, set to a non-awaiting state
+    new_order_state: isPaystack ? 'idle' : 'awaiting_payment',
+    new_pending_order: isPaystack ? null : {
       ...(pendingOrder || {}),
       order_id:     orderId,
       order_number: orderNumber,
@@ -2214,6 +2327,139 @@ async function handleOrderCreation({ tenantId, subscriptionPlan, defaultOnlineSt
       shipping_address: details.shipping_address,
     },
   };
+}
+
+/**
+ * Build the full payment message for a confirmed booking, generating a Paystack link if configured.
+ * Shared by both the slot-tap path and the AI-driven book_service path.
+ */
+async function buildBookingPaymentMessage({
+  tenantId, bookingId, serviceTitle, scheduledAt, dateLabel, timeLabel,
+  customerName, customerPhone, customerEmail,
+  service_id,
+  paymentInstructionType, paypalEmail, bankAccountName, bankName,
+  bankAccountNumber, paymentInstructions, bookingData,
+}) {
+  const isPaystack = (paymentInstructionType || '').toLowerCase() === 'paystack';
+  let resolvedPaymentLink = null;
+
+  if (isPaystack && bookingId) {
+    const safeEmail = customerEmail || `${(customerPhone || '').replace(/[^\d]/g, '')}@wa.mycroshop.local`;
+    const result = await backendApi.initializePaymentLink({
+      tenant_id:          tenantId,
+      amount:             bookingData?.price != null ? parseFloat(bookingData.price) : 0,
+      email:              safeEmail,
+      name:               customerName || 'WhatsApp Customer',
+      currency:           'NGN',
+      customer_phone:     (customerPhone || '').replace(/[^\d+]/g, ''),
+      whatsapp_message_id: null,
+      metadata: {
+        source:         'whatsapp_ai',
+        channel:        'whatsapp',
+        flow:           'service_booking',
+        tenant_id:      tenantId,
+        booking_id:     bookingId,
+        service_id:     service_id,
+        service_title:  serviceTitle,
+        scheduled_at:   scheduledAt,
+        timezone:       'Africa/Lagos',
+        location_type:  bookingData?.location_type || 'in_person',
+        customer_name:  customerName || 'WhatsApp Customer',
+        customer_phone: (customerPhone || '').replace(/[^\d+]/g, ''),
+        customer_email: customerEmail || safeEmail,
+        payment_context: { origin: 'ai_sales_agent', initiated_at: new Date().toISOString() },
+      },
+    }).catch(e => { console.error('[booking] initializePaymentLink failed:', e.message); return null; });
+
+    if (result?.payment_link) {
+      resolvedPaymentLink = result.payment_link;
+      console.log(`[booking] Paystack link generated for booking ${bookingId}`);
+    }
+  }
+
+  const payInstructions = buildPaymentInstructions({
+    paymentInstructionType, paypalEmail,
+    bankAccountName, bankName, bankAccountNumber,
+    paymentInstructions, total: null, paymentLink: resolvedPaymentLink,
+  });
+
+  const lines = [
+    `✅ *Booking Confirmed!*`,
+    ``,
+    `Service: *${serviceTitle}*`,
+    `Date & Time: *${dateLabel} at ${timeLabel}*`,
+    ``,
+    payInstructions,
+  ];
+  if (!isPaystack) {
+    lines.push(``, `Once you've paid, *send me a photo of your receipt* and I'll notify the store right away. 📸`);
+  }
+
+  return {
+    text: lines.join('\n'),
+    isPaystack,
+    resolvedPaymentLink,
+  };
+}
+
+// ── Refund request handler ────────────────────────────────────────────────────
+// Called when AI emits a 'request_refund' action with extracted refund details.
+async function handleRefundRequest({
+  tenantId, customerPhone,
+  customerName, customerEmail,
+  orderId, receiptId, reason, details: refundDetails,
+}) {
+  const log = (tag, ...a) => console.log(`[refund:${tag}]`, ...a);
+
+  if (!orderId && !receiptId) {
+    log('skip', 'No order_id or receipt_id — cannot submit refund');
+    return {
+      type: 'replace',
+      text: "To process a refund I'll need your order number or receipt ID. Could you share that?",
+    };
+  }
+
+  if (!reason) {
+    return {
+      type: 'replace',
+      text: "What's the reason for the refund? A quick description helps the store process it faster.",
+    };
+  }
+
+  log('submit', `order=${orderId} receipt=${receiptId} reason="${reason}"`);
+
+  const result = await backendApi.submitRefundRequest({
+    tenant_id:      tenantId,
+    customer_name:  customerName  || 'Unknown',
+    customer_phone: customerPhone,
+    customer_email: customerEmail || '',
+    order_id:       orderId       || undefined,
+    receipt_id:     receiptId     || undefined,
+    source_channel: 'whatsapp_ai',
+    reason:         reason,
+    details:        refundDetails || '',
+  }).catch(e => { console.error('[refund] submitRefundRequest failed:', e.message); return null; });
+
+  if (result?.success) {
+    log('done', 'Refund request submitted');
+    return {
+      type: 'replace',
+      text: [
+        `✅ Your refund request has been submitted.`,
+        ``,
+        `*Order/Receipt:* ${orderId ? `#${orderId}` : receiptId}`,
+        `*Reason:* ${reason}`,
+        ``,
+        `The store will review it and get back to you here. This usually takes 1–3 business days.`,
+      ].join('\n'),
+    };
+  } else {
+    log('error', result?.message || 'unknown error');
+    return {
+      type: 'replace',
+      text: `We couldn't submit your refund request right now. Please try again or contact the store directly.`,
+    };
+  }
 }
 
 /**
