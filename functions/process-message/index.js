@@ -816,11 +816,22 @@ async function handleReceiptSubmission({
 
   // 3. Notify store owner — send receipt image + order summary + Approve/Decline buttons
   if (!ownerWhatsappNumber) {
-    log('owner', 'no owner_whatsapp_number — skipping owner notification');
+    // Log as ERROR so this is visible in Cloud Console — this is a config problem
+    console.error(
+      `[receipt:owner] MISSING owner_whatsapp_number for tenant ${tenantId}. ` +
+      `Receipt for order ${orderNumber} was attached but owner was NOT notified. ` +
+      `Fix: ensure resolve-tenant API returns owner_whatsapp_number for this tenant.`
+    );
+    // Still a success from the customer's perspective — their receipt is saved.
+    // But log it loudly so the merchant knows to configure their WhatsApp number.
     return;
   }
 
   const ownerPhone = ownerWhatsappNumber.replace(/[+\s]/g, '');
+  if (!ownerPhone) {
+    console.error(`[receipt:owner] owner_whatsapp_number is blank/whitespace for tenant ${tenantId}. Order ${orderNumber} receipt not delivered to owner.`);
+    return;
+  }
 
   // Build a clear order summary for the owner
   const itemsSummary = (pendingOrder.items || [])
@@ -853,6 +864,7 @@ async function handleReceiptSubmission({
   const btnApprove = `approve_${orderId}_${customerPhone}`;
   const btnDecline = `decline_${orderId}_${customerPhone}`;
 
+  log('owner', `Attempting interactive buttons to owner ${ownerPhone}`);
   const ownerSendResult = await whatsapp.sendInteractiveButtons(
     phoneNumberId, accessToken, ownerPhone,
     ownerBody,
@@ -863,22 +875,33 @@ async function handleReceiptSubmission({
     `Order ${orderNumber}`,
     `Reply within 24hrs • ${storeNameResolved}`
   ).catch(e => {
-    console.error('[receipt] owner interactive notification failed:', e.message);
+    console.error('[receipt:owner] interactive buttons FAILED:', e.message, '| ownerPhone:', ownerPhone);
     return null;
   });
 
-  // Fallback: if interactive buttons fail (e.g. channel restriction), send plain text alert.
-  if (!ownerSendResult?.success) {
-    await whatsapp.sendMessage(
+  if (ownerSendResult?.success) {
+    log('owner', `Interactive approval request sent to ${ownerPhone} (msgId: ${ownerSendResult.messageId})`);
+  } else {
+    // Fallback: plain text — interactive buttons may fail on some WhatsApp accounts or channel types
+    console.warn(`[receipt:owner] Interactive buttons failed for ${ownerPhone} — falling back to plain text`);
+    const fallbackResult = await whatsapp.sendMessage(
       phoneNumberId,
       accessToken,
       ownerPhone,
-      `${ownerBody}\n\nReply in dashboard to approve or decline this payment.`,
+      `${ownerBody}\n\nTo approve: reply APPROVE ${orderId}\nTo decline: reply DECLINE ${orderId}\n\nOr use your dashboard to approve/decline.`,
       null
-    ).catch(e => console.error('[receipt] owner text fallback failed:', e.message));
+    ).catch(e => {
+      console.error('[receipt:owner] text fallback ALSO failed:', e.message, '| ownerPhone:', ownerPhone);
+      return null;
+    });
+    if (fallbackResult?.success) {
+      log('owner', `Plain-text fallback sent to ${ownerPhone}`);
+    } else {
+      console.error(`[receipt:owner] BOTH interactive and text notification failed for tenant ${tenantId}, order ${orderNumber}. Owner NOT notified.`);
+    }
   }
 
-  log('owner', 'notification sent');
+  log('owner', 'notification flow complete');
 }
 
 // ── Owner button reply handler ─────────────────────────────────────────────────
@@ -998,11 +1021,19 @@ async function handleBookingReceiptSubmission({
 
   // Notify store owner with Approve/Decline buttons
   if (!ownerWhatsappNumber) {
-    log('owner', 'no owner_whatsapp_number — skipping owner notification');
+    console.error(
+      `[booking-receipt:owner] MISSING owner_whatsapp_number for tenant ${tenantId}. ` +
+      `Receipt for booking #${bookingId} was attached but owner was NOT notified. ` +
+      `Fix: ensure resolve-tenant API returns owner_whatsapp_number for this tenant.`
+    );
     return;
   }
 
   const ownerPhone = ownerWhatsappNumber.replace(/[+\s]/g, '');
+  if (!ownerPhone) {
+    console.error(`[booking-receipt:owner] owner_whatsapp_number is blank for tenant ${tenantId}. Booking #${bookingId} receipt not delivered to owner.`);
+    return;
+  }
   const ownerBody = [
     `💰 *Booking Payment Receipt — ${storeNameResolved}*`,
     ``,
@@ -1017,6 +1048,7 @@ async function handleBookingReceiptSubmission({
   const btnApprove = `bapprove_${bookingId}_${customerPhone}`;
   const btnDecline = `bdecline_${bookingId}_${customerPhone}`;
 
+  log('owner', `Attempting interactive buttons to owner ${ownerPhone}`);
   const ownerSendResult = await whatsapp.sendInteractiveButtons(
     phoneNumberId, accessToken, ownerPhone,
     ownerBody,
@@ -1027,19 +1059,30 @@ async function handleBookingReceiptSubmission({
     `Booking #${bookingId}`,
     `Reply within 24hrs • ${storeNameResolved}`
   ).catch(e => {
-    console.error('[booking-receipt] owner interactive notification failed:', e.message);
+    console.error('[booking-receipt:owner] interactive buttons FAILED:', e.message, '| ownerPhone:', ownerPhone);
     return null;
   });
 
-  if (!ownerSendResult?.success) {
-    await whatsapp.sendMessage(
+  if (ownerSendResult?.success) {
+    log('owner', `Interactive approval request sent to ${ownerPhone} (msgId: ${ownerSendResult.messageId})`);
+  } else {
+    console.warn(`[booking-receipt:owner] Interactive buttons failed for ${ownerPhone} — falling back to plain text`);
+    const fallbackResult = await whatsapp.sendMessage(
       phoneNumberId, accessToken, ownerPhone,
-      `${ownerBody}\n\nReview in your dashboard to approve or decline.`,
+      `${ownerBody}\n\nTo approve: reply APPROVE ${bookingId}\nTo decline: reply DECLINE ${bookingId}\n\nOr use your dashboard to approve/decline.`,
       null
-    ).catch(e => console.error('[booking-receipt] owner text fallback failed:', e.message));
+    ).catch(e => {
+      console.error('[booking-receipt:owner] text fallback ALSO failed:', e.message, '| ownerPhone:', ownerPhone);
+      return null;
+    });
+    if (fallbackResult?.success) {
+      log('owner', `Plain-text fallback sent to ${ownerPhone}`);
+    } else {
+      console.error(`[booking-receipt:owner] BOTH interactive and text notification failed for tenant ${tenantId}, booking #${bookingId}. Owner NOT notified.`);
+    }
   }
 
-  log('owner', 'notification sent');
+  log('owner', 'notification flow complete');
 }
 
 // ── Booking owner button reply ────────────────────────────────────────────────
