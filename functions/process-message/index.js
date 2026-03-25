@@ -516,7 +516,9 @@ async function processMessage(messageData) {
         const searchTerm = inventoryIntent.search || undefined;
         const limit = searchTerm ? 5 : 20;
 
-        const result = await backendApi.listProducts(tenantId, subscriptionPlan, { search: searchTerm, limit });
+        // Expand the search term before sending (e.g. "boot" -> "boot", "boots" -> "boot")
+        const expandedSearchTerm = expandProductSearchTerm(searchTerm) || searchTerm;
+        const result = await backendApi.listProducts(tenantId, subscriptionPlan, { search: expandedSearchTerm, limit });
 
         if (result?.products?.length) {
           // For contextual requests (picture of X), inject only the matched product
@@ -579,7 +581,8 @@ async function processMessage(messageData) {
       bookingPreempt
       && (bookingPreempt.type === 'send_date_list'
         || bookingPreempt.type === 'send_slot_list'
-        || bookingPreempt.type === 'replace');
+        || bookingPreempt.type === 'replace'
+        || bookingPreempt.type === 'service_image');
 
     const aiResponse = skipGeminiForBooking
       ? { text: bookingPreempt.type === 'replace' ? (bookingPreempt.text || '') : '', actions: [], order_state: orderState }
@@ -618,6 +621,11 @@ async function processMessage(messageData) {
         || 'Choose an option below.';
     } else if (bookingPreempt?.type === 'replace' && skipGeminiForBooking) {
       finalReply = bookingPreempt.text || finalReply;
+    } else if (bookingPreempt?.type === 'service_image' && skipGeminiForBooking) {
+      finalReply = bookingPreempt.text || finalReply;
+      if (bookingPreempt.image?.url) {
+        pendingImages.push(bookingPreempt.image);
+      }
     }
 
     // Safety net: if Gemini emits list_inventory with share_media for a contextual picture request,
@@ -1683,15 +1691,28 @@ async function handleListInventory({ tenantId, subscriptionPlan, search, share_m
       search: search || undefined,
       limit:  search ? 12 : 20,
     });
-    if (!result?.products?.length) {
+
+    if (!result?.products?.length && search) {
+      // Primary search returned nothing — try smart multi-term search before giving up
+      console.log(`[listInventory] no results for "${search}" — trying multi-term search`);
+      const candidates = await multiTermProductSearch(tenantId, subscriptionPlan, search).catch(() => []);
+      if (candidates.length) {
+        products = candidates;
+        console.log(`[listInventory] multi-term found ${products.length} products for "${search}"`);
+      } else {
+        return {
+          type: 'replace',
+          text: `We don't have anything matching "${search}" right now. Want to see the full catalog?`,
+        };
+      }
+    } else if (!result?.products?.length) {
       return {
         type: 'replace',
-        text: search
-          ? `We don't have anything matching "${search}" right now. Want to see the full catalog?`
-          : "Catalog's being updated right now. Ask about a specific product and I'll check for you.",
+        text: "Catalog's being updated right now. Ask about a specific product and I'll check for you.",
       };
+    } else {
+      products = result.products;
     }
-    products = result.products;
   }
   const base = (process.env.BACKEND_BASE_URL || process.env.MYCROSHOP_API_URL || 'https://backend.mycroshop.com').replace(/\/$/, '');
 
@@ -2066,6 +2087,24 @@ async function handleBookingIntentFromMessage({
   if (!pickedService && conversationHistory?.length) {
     pickedService = pickServiceFromConversationHistory(services, conversationHistory);
   }
+
+  // ── Service image request ─────────────────────────────────────────────────
+  // Customer asked to see a picture/photo of a service they're enquiring about.
+  // We have the service_image_url from the API — send it directly.
+  const isImageRequest = /\b(picture|photo|image|pic|see it|show me|show|look like|looks like)\b/i.test(message);
+  if (isImageRequest && pickedService?.service_image_url) {
+    const price = pickedService.price != null ? ` — ₦${Number(pickedService.price).toLocaleString()}` : '';
+    const dur   = pickedService.duration_minutes ? ` (${pickedService.duration_minutes} min)` : '';
+    return {
+      type: 'service_image',
+      text: `Here's a look at our *${pickedService.service_title}* service${price}${dur}. Ready to book? Just tell me which date works for you.`,
+      image: {
+        url:     pickedService.service_image_url,
+        caption: `${pickedService.service_title}${price}${dur}`,
+      },
+    };
+  }
+
   const parsedDate = extractDateFromMessage(message);
   const vagueListFollowUp = isVagueBookingListFollowUp(message);
 
@@ -2150,32 +2189,40 @@ async function handleQueryInventory({ tenantId, subscriptionPlan, productName, i
   }
 
   if (!product) {
+    // ── Smart multi-term search ──────────────────────────────────────────────
+    // Tries: exact name → synonym expansion → individual words → full catalog filter
+    // This handles "boot" matching "Docter Martin Boot", "rain boot" etc.
     try {
-      const searchResult = await backendApi.listProducts(tenantId, subscriptionPlan, { search: productName, limit: 5 });
-      if (searchResult?.products?.length) {
-        product = searchResult.products.find(p =>
-          p.name?.toLowerCase() === productName.toLowerCase()
-        ) || searchResult.products.find(p =>
-          p.name?.toLowerCase().includes(productName.toLowerCase())
-        ) || searchResult.products[0];
+      const candidates = await multiTermProductSearch(tenantId, subscriptionPlan, productName);
+      if (candidates.length === 1) {
+        // Single unambiguous match — use it directly
+        product = candidates[0];
+        console.log(`[queryInventory] multi-term search found: ${product.name}`);
+      } else if (candidates.length > 1) {
+        // Multiple matches — pick the closest name match, or show options
+        const needle = productName.toLowerCase();
+        product = candidates.find(p => p.name?.toLowerCase() === needle)
+          || candidates.find(p => p.name?.toLowerCase().includes(needle))
+          || candidates.find(p => needle.includes(p.name?.toLowerCase()))
+          || null;
+
+        if (!product) {
+          // Show all candidates as suggestions
+          let text = `We have a few options that might match:\n\n`;
+          candidates.slice(0, 5).forEach((p, i) => {
+            const { line } = priceStock(p);
+            text += `${i + 1}. ${p.name} – ${line}\n`;
+          });
+          text += '\nWhich one are you looking for?';
+          return { type: 'replace', text };
+        }
       }
     } catch (e) {
-      console.error('[queryInventory] listProducts fallback failed:', e.message);
+      console.error('[queryInventory] multiTermProductSearch failed:', e.message);
     }
   }
 
   if (!product) {
-    try {
-      const broad = await backendApi.listProducts(tenantId, subscriptionPlan, {
-        search: productName.split(' ')[0], limit: 5
-      });
-      if (broad?.products?.length) {
-        let text = `Couldn't find "${productName}" exactly. Did you mean:\n\n`;
-        broad.products.forEach((p, i) => { const { line } = priceStock(p); text += `${i+1}. ${p.name} – ${line}\n`; });
-        text += '\nWhich one?';
-        return { type: 'replace', text };
-      }
-    } catch (_) {}
     return { type: 'replace', text: `We don't have "${productName}" right now. Want to see everything we carry?` };
   }
 
@@ -3028,7 +3075,135 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
     return { needed: true, search: lastProduct, contextual: !!lastProduct };
   }
 
+  // ── Single-word / short product query fallback ───────────────────────────
+  // Messages like "boot", "sandals", "crocs", "loafers" that don't match patterns
+  // above but ARE clearly product-related should still trigger an inventory search.
+  const wordCount = m.trim().split(/\s+/).length;
+  if (wordCount <= 4 && !isBookingIntentMessage(message)) {
+    const cleanMsg = m.trim().replace(/[?!.,]/g, '').trim();
+    const nonProductWords = /^(hi|hello|hey|okay|ok|yes|no|sure|thanks|thank you|please|good|great|nice|fine|cool|alright|what|how|when|where|why|who|send|show|list|any|got|have)$/i;
+    if (!nonProductWords.test(cleanMsg) && cleanMsg.length >= 3) {
+      const expanded = expandProductSearchTerm(cleanMsg);
+      return { needed: true, search: expanded || cleanMsg };
+    }
+  }
+
   return { needed: false, search: null };
+}
+
+/**
+ * Expand a product search term with synonyms and category keywords.
+ * This handles cases where the customer uses a generic word ("boot", "sneaker")
+ * that doesn't exactly match the product name in the database ("Docter Martin Boot").
+ *
+ * Returns null if no expansion is needed (use original term).
+ * Returns a space-separated string of terms if we want to try multiple searches.
+ */
+function expandProductSearchTerm(term) {
+  const t = String(term || '').toLowerCase().trim();
+
+  // Footwear category expansions
+  const synonymMap = {
+    'boot':     'boot',
+    'boots':    'boot',
+    'sneaker':  'sneaker',
+    'sneakers': 'sneaker',
+    'sandal':   'sandal',
+    'sandals':  'sandal',
+    'loafer':   'loafer',
+    'loafers':  'loafer',
+    'clog':     'clog',
+    'clogs':    'clog',
+    'croc':     'croc',
+    'crocs':    'croc',
+    'oxford':   'oxford',
+    'oxfords':  'oxford',
+    'slipper':  'slipper',
+    'slippers': 'slipper',
+    'heel':     'heel',
+    'heels':    'heel',
+    'flat':     'flat',
+    'flats':    'flat',
+    'pump':     'pump',
+    'pumps':    'pump',
+    'mule':     'mule',
+    'mules':    'mule',
+    'slide':    'slide',
+    'slides':   'slide',
+    'flip flop':  'flip',
+    'flip flops': 'flip',
+    'rain boot':  'rain',
+    'rain boots': 'rain',
+    'ankle boot': 'boot',
+    'ankle boots': 'boot',
+  };
+
+  // Direct synonym match — return the canonical search term
+  if (synonymMap[t]) return synonymMap[t];
+
+  // Plural/singular normalisation — strip trailing 's' if word is > 4 chars
+  if (t.endsWith('s') && t.length > 4) {
+    const singular = t.slice(0, -1);
+    if (synonymMap[singular]) return synonymMap[singular];
+    return singular; // try singular form as broader search
+  }
+
+  return null; // no expansion — caller uses original term
+}
+
+/**
+ * Try multiple search terms for a product and return all matching products.
+ * Used when the primary search returns nothing — tries broader terms before giving up.
+ */
+async function multiTermProductSearch(tenantId, subscriptionPlan, primaryTerm) {
+  const tried = new Set();
+  const allProducts = [];
+
+  const trySearch = async (term) => {
+    if (!term || tried.has(term)) return;
+    tried.add(term);
+    const r = await backendApi.listProducts(tenantId, subscriptionPlan, { search: term, limit: 10 }).catch(() => null);
+    if (r?.products?.length) {
+      for (const p of r.products) {
+        if (!allProducts.find(x => x.id === p.id)) allProducts.push(p);
+      }
+    }
+  };
+
+  // 1. Try the primary term
+  await trySearch(primaryTerm);
+
+  // 2. If no results, try expanded/synonym form
+  if (!allProducts.length) {
+    const expanded = expandProductSearchTerm(primaryTerm);
+    if (expanded && expanded !== primaryTerm) await trySearch(expanded);
+  }
+
+  // 3. If still nothing, try each individual word (handles "rain boot" → "rain", "boot")
+  if (!allProducts.length && primaryTerm.includes(' ')) {
+    for (const word of primaryTerm.split(' ')) {
+      if (word.length >= 3) await trySearch(word);
+    }
+  }
+
+  // 4. Last resort: fetch full catalog and filter client-side
+  if (!allProducts.length) {
+    const all = await backendApi.listProducts(tenantId, subscriptionPlan, { limit: 30 }).catch(() => null);
+    if (all?.products?.length) {
+      const needle = primaryTerm.toLowerCase();
+      const expanded = (expandProductSearchTerm(primaryTerm) || '').toLowerCase();
+      const filtered = all.products.filter(p => {
+        const name = (p.name || '').toLowerCase();
+        const desc = (p.description || '').toLowerCase();
+        const cat  = (p.category || '').toLowerCase();
+        return name.includes(needle) || desc.includes(needle) || cat.includes(needle)
+          || (expanded && (name.includes(expanded) || desc.includes(expanded) || cat.includes(expanded)));
+      });
+      allProducts.push(...filtered);
+    }
+  }
+
+  return allProducts;
 }
 
 function isBookingIntentMessage(message = '') {
@@ -3259,6 +3434,8 @@ function formatProductsForPrompt(products) {
   return products.slice(0, 20).map((p, i) => {
     const { line } = priceStock(p);
     let entry = `${i + 1}. ${p.name} – ${line}`;
+    // Include category so Gemini can match "boots" → "Docter Martin Boot [boots]"
+    if (p.category) entry += ` [${p.category}]`;
     if (p.variants?.length) {
       // Compact grouped summary: "Black: 42/43 · White: 44/45"
       const summary = buildVariantSummary(p.variants);
