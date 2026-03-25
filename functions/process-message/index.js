@@ -683,7 +683,12 @@ async function processMessage(messageData) {
           finalReply = mergeIntroAndData(finalReply, result.text);
         }
       } else if (result.type === 'catalog_media') {
-        // Catalog with images — Gemini's intro text is the reply, images come after
+        // Catalog with images — Gemini's intro text is the reply, images come after.
+        // If the action handler also supplied a text list (e.g. services catalog),
+        // merge it into the reply so the customer sees the full list + photos.
+        if (result.text) {
+          finalReply = mergeIntroAndData(finalReply, result.text);
+        }
         if (result.images?.length) {
           pendingImages.push(...result.images);
         }
@@ -1515,8 +1520,23 @@ async function handleAction(action, ctx) {
   try {
     switch (action.type) {
       case 'list_services':
-        // Gemini often emits list_services for ANY booking question — including
-        // "what dates for Nail test566?". Route those to availability flow instead of dumping the full list.
+        // GUARD 1: If customer is clearly talking about paying for/buying a product they
+        // discussed in this conversation, NEVER show services — ask for order details instead.
+        if (isProductPurchasePaymentIntent(message, conversationHistory, orderState)) {
+          const lastProduct = extractLastProduct(conversationHistory);
+          if (lastProduct) {
+            return {
+              type: 'replace',
+              text: `To place your order for the ${lastProduct}, I just need your name, phone number, and delivery address — what are those?`,
+            };
+          }
+          return {
+            type: 'replace',
+            text: `Sure, let's get your order placed. What's your name, phone number, and delivery address?`,
+          };
+        }
+        // GUARD 2: Gemini often emits list_services for booking DATE/availability questions —
+        // route those to the availability flow instead of dumping the full service list.
         if (isBookingDateOrAvailabilityQuery(message) || shouldRouteListServicesToBooking(message)) {
           return await handleBookingIntentFromMessage({
             tenantId, subscriptionPlan, defaultOnlineStoreId, message, conversationHistory,
@@ -1857,6 +1877,7 @@ async function handleBookingMoreTimesList({
 }
 
 // ── Booking: list services ────────────────────────────────────────────────────
+// Returns text list + queues service images to send after the text (same pattern as products)
 async function handleListServices({ tenantId, subscriptionPlan, defaultOnlineStoreId }) {
   const result = await backendApi.listServices(tenantId, subscriptionPlan, {
     ...(defaultOnlineStoreId ? { online_store_id: defaultOnlineStoreId } : {})
@@ -1864,11 +1885,29 @@ async function handleListServices({ tenantId, subscriptionPlan, defaultOnlineSto
   if (!result?.services?.length) {
     return { type: 'replace', text: "We don't have any bookable services at the moment. Ask again later or contact the store." };
   }
-  const lines = result.services.map((s, i) => {
+
+  const services = result.services;
+  const lines = services.map((s, i) => {
     const price = s.price ? `₦${Number(s.price).toLocaleString()}` : 'Price on request';
     return `${i + 1}. ${s.service_title} – ${s.duration_minutes || 30} min, ${price}`;
   });
   const text = `Here are our services:\n\n${lines.join('\n')}\n\nWhich one would you like to book, and for which date?`;
+
+  // Collect service images — send after the text list (same UX as product catalog with photos)
+  const images = services
+    .filter(s => s.service_image_url && s.service_image_url.startsWith('http'))
+    .slice(0, 5)
+    .map(s => {
+      const price = s.price ? ` — ₦${Number(s.price).toLocaleString()}` : '';
+      const dur   = s.duration_minutes ? ` (${s.duration_minutes} min)` : '';
+      return { url: s.service_image_url, caption: `${s.service_title}${price}${dur}` };
+    });
+
+  if (images.length > 0) {
+    // Return catalog_media so the main flow sends text first, then images
+    return { type: 'catalog_media', text, images };
+  }
+
   return { type: 'data', text };
 }
 
@@ -2995,6 +3034,51 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
 function isBookingIntentMessage(message = '') {
   const m = String(message).toLowerCase();
   return /\b(book|booking|appointment|schedule|service|services|available date|available dates|what dates|which dates|time slot|timeslot|slot|slots|availability)\b/.test(m);
+}
+
+/**
+ * Returns true when the customer is asking to PAY FOR / ORDER a physical product
+ * they have been discussing — NOT to book a service.
+ *
+ * This prevents Gemini's list_services hallucination where "can I pay for the ones
+ * I have chosen?" gets routed to a service listing instead of order collection.
+ *
+ * Signals we look for (any one is enough):
+ *   1. Message contains payment/purchase words
+ *   2. Recent conversation history shows product browsing (₦ prices, product names)
+ *   3. Order state is collecting_details (mid-order) or idle after product discussion
+ */
+function isProductPurchasePaymentIntent(message = '', conversationHistory = [], orderState = 'idle') {
+  const m = String(message).toLowerCase().trim();
+
+  // Must contain a payment/purchase/checkout intent word
+  const hasPurchaseIntent = /\b(pay|payment|checkout|order|buy|purchase|proceed|place.*order|ready to (pay|buy|order)|can i (pay|buy|order)|i want to (pay|buy|order)|for the ones|i.ve chosen|i have chosen|i selected|i picked)\b/i.test(m);
+  if (!hasPurchaseIntent) return false;
+
+  // If they explicitly say "book", "appointment", or "service" — it's a booking, not a purchase
+  const hasBookingWord = /\b(book|appointment|service|session|schedule)\b/i.test(m);
+  if (hasBookingWord) return false;
+
+  // If order is being collected, it's definitely a product purchase
+  if (orderState === 'collecting_details' || orderState === 'confirming') return true;
+
+  // Check conversation history for product shopping signals (₦ prices, product names in AI replies)
+  if (conversationHistory.length > 0) {
+    const recentBlob = conversationHistory
+      .slice(-10)
+      .map(x => String(x.text || x.content || ''))
+      .join(' ')
+      .toLowerCase();
+
+    // Recent conversation has prices — product browsing was happening
+    if (recentBlob.includes('₦')) return true;
+    // Recent conversation mentions shoes/products explicitly
+    if (/\b(sneakers?|shoes?|loafers?|boots?|sandals?|clacks?|clogs?|crocs?|oxfords?|product|item|pairs?)\b/.test(recentBlob)) return true;
+    // AI asked for address/name (order collection in progress)
+    if (/\b(delivery address|your address|your name|phone number|what.s your name)\b/.test(recentBlob)) return true;
+  }
+
+  return false;
 }
 
 /** User is asking for dates/slots/availability — not a generic "list all services". */
