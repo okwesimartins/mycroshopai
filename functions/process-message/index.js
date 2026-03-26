@@ -511,30 +511,79 @@ async function processMessage(messageData) {
 
     if (inventoryIntent.needed) {
       try {
-        // If this is a contextual picture request (customer already said what they want),
-        // fetch ONLY that specific product so Gemini doesn't have 16 products to pick from
         const searchTerm = inventoryIntent.search || undefined;
-        const limit = searchTerm ? 5 : 20;
 
-        // Expand the search term before sending (e.g. "boot" -> "boot", "boots" -> "boot")
-        const expandedSearchTerm = expandProductSearchTerm(searchTerm) || searchTerm;
-        const result = await backendApi.listProducts(tenantId, subscriptionPlan, { search: expandedSearchTerm, limit });
+        let products = null;
 
-        if (result?.products?.length) {
-          // For contextual requests (picture of X), inject only the matched product
-          const products = inventoryIntent.contextual && result.products.length > 1
-            ? result.products.slice(0, 1)  // just the top match
-            : result.products;
+        if (inventoryIntent.categorySearch && searchTerm) {
+          // ── Category-based search ─────────────────────────────────────────
+          // The backend only does name-matching, so "boots" would miss "Docter Martin Boot".
+          // Instead: fetch the FULL catalog and filter client-side by name + category + description.
+          log('preload', `Category search for "${searchTerm}" — fetching full catalog for client-side filter`);
+          const fullCatalog = await backendApi.listProducts(tenantId, subscriptionPlan, { limit: 50 });
+          if (fullCatalog?.products?.length) {
+            const needle = searchTerm.toLowerCase().replace(/s$/, ''); // "boots" → "boot", "sandals" → "sandal"
+            const matched = fullCatalog.products.filter(p => {
+              const name = (p.name || '').toLowerCase();
+              const cat  = (p.category || '').toLowerCase();
+              const desc = (p.description || '').toLowerCase();
+              return name.includes(needle) || cat.includes(needle) || desc.includes(needle)
+                // Also try with trailing s stripped from product fields (boot matches boots)
+                || cat.replace(/s$/, '').includes(needle)
+                || needle.replace(/s$/, '') !== needle && (
+                    name.includes(needle.replace(/s$/, '')) ||
+                    cat.includes(needle.replace(/s$/, '')) ||
+                    desc.includes(needle.replace(/s$/, ''))
+                  );
+            });
+            products = matched.length ? matched : fullCatalog.products; // fallback to full catalog if no category match
+            log('preload', `Category filter "${searchTerm}": ${matched.length}/${fullCatalog.products.length} products matched`);
+          }
 
+        } else if (inventoryIntent.contextual && searchTerm) {
+          // ── Contextual single-product request ────────────────────────────
+          // Customer said "show me a picture of X" — fetch only that product
+          const expandedSearchTerm = expandProductSearchTerm(searchTerm) || searchTerm;
+          const result = await backendApi.listProducts(tenantId, subscriptionPlan, { search: expandedSearchTerm, limit: 5 });
+          products = result?.products?.length ? result.products.slice(0, 1) : null;
+
+        } else {
+          // ── Standard name/keyword search or full catalog ──────────────────
+          const expandedSearchTerm = searchTerm ? (expandProductSearchTerm(searchTerm) || searchTerm) : undefined;
+          const limit = searchTerm ? 12 : 20;
+          const result = await backendApi.listProducts(tenantId, subscriptionPlan, { search: expandedSearchTerm, limit });
+
+          // If name-based search returned nothing, try category fallback
+          if (!result?.products?.length && searchTerm) {
+            log('preload', `Name search "${searchTerm}" empty — trying full catalog category filter`);
+            const fullCatalog = await backendApi.listProducts(tenantId, subscriptionPlan, { limit: 50 });
+            if (fullCatalog?.products?.length) {
+              const needle = searchTerm.toLowerCase().replace(/s$/, '');
+              const matched = fullCatalog.products.filter(p => {
+                const name = (p.name || '').toLowerCase();
+                const cat  = (p.category || '').toLowerCase();
+                const desc = (p.description || '').toLowerCase();
+                return name.includes(needle) || cat.includes(needle) || desc.includes(needle)
+                  || cat.replace(/s$/, '').includes(needle);
+              });
+              products = matched.length ? matched : null;
+              log('preload', `Fallback category filter "${needle}": ${matched.length} matches`);
+            }
+          } else {
+            products = result?.products || null;
+          }
+        }
+
+        if (products?.length) {
           inventoryText = formatProductsForPrompt(products);
-          prefetchedProducts = products; // cache — action handlers will use this, not re-fetch
+          prefetchedProducts = products;
           if (inventoryIntent.contextual) {
             forcedProductName = products[0]?.name || searchTerm;
           }
-          log('preload', `${products.length} products injected (search: ${searchTerm || 'all'}, contextual: ${!!inventoryIntent.contextual})`);
+          log('preload', `${products.length} products injected (search: "${searchTerm || 'all'}", category: ${!!inventoryIntent.categorySearch}, contextual: ${!!inventoryIntent.contextual})`);
         } else {
           inventoryText = '[No products found in catalog right now]';
-          log('preload', 'no products found');
+          log('preload', `no products found for "${searchTerm || 'all'}"`);
         }
       } catch (e) {
         logErr('preload', e); // non-fatal — Gemini still responds
@@ -3046,9 +3095,11 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
       if (searchTerm && searchTerm.length > 1) {
         const colorMatches = raw.match(colorWords);
         const colorHint = colorMatches ? colorMatches.join(', ') : null;
-        // Flag if the message also explicitly asked for variations
         const wantsVariations = /\b(variation|option|size|color|colour)s?\b/i.test(message);
-        return { needed: true, search: searchTerm, colorHint, wantsVariations };
+        // If the extracted term is a category word, flag it so pre-fetch uses full-catalog filter
+        const categoryWordPattern = /^(boot|boots|sandal|sandals|sneaker|sneakers|loafer|loafers|clog|clogs|croc|crocs|oxford|oxfords|slipper|slippers|heel|heels|flat|flats|pump|pumps|mule|mules|slide|slides|trainer|trainers|shoe|shoes)$/i;
+        const isCategoryWord = categoryWordPattern.test(searchTerm);
+        return { needed: true, search: searchTerm, colorHint, wantsVariations, categorySearch: isCategoryWord };
       }
     }
   }
@@ -3075,13 +3126,23 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
     return { needed: true, search: lastProduct, contextual: !!lastProduct };
   }
 
-  // ── Single-word / short product query fallback ───────────────────────────
-  // Messages like "boot", "sandals", "crocs", "loafers" that don't match patterns
-  // above but ARE clearly product-related should still trigger an inventory search.
+  // ── Short message product/category query ────────────────────────────────
+  // "boot", "sandals", "show me boots", "can i see the boots you have" etc.
+  // These don't match the specificPatterns above (which need context words like "do you have").
+  // We detect the category word and flag categorySearch:true so the pre-fetch fetches the
+  // FULL catalog and filters client-side by category + name + description.
   const wordCount = m.trim().split(/\s+/).length;
-  if (wordCount <= 4 && !isBookingIntentMessage(message)) {
+  if (wordCount <= 8 && !isBookingIntentMessage(message)) {
     const cleanMsg = m.trim().replace(/[?!.,]/g, '').trim();
     const nonProductWords = /^(hi|hello|hey|okay|ok|yes|no|sure|thanks|thank you|please|good|great|nice|fine|cool|alright|what|how|when|where|why|who|send|show|list|any|got|have)$/i;
+    // Known footwear / product category words
+    const categoryWords = /\b(boot|boots|sandal|sandals|sneaker|sneakers|loafer|loafers|clog|clogs|croc|crocs|oxford|oxfords|slipper|slippers|heel|heels|flat|flats|pump|pumps|mule|mules|slide|slides|flip.?flop|rain.?boot|ankle.?boot|trainer|trainers|shoe|shoes)\b/i;
+    const categoryMatch = cleanMsg.match(categoryWords);
+    if (categoryMatch && !nonProductWords.test(cleanMsg)) {
+      // Flag as a category search — pre-fetch will do full catalog + client-side filter
+      return { needed: true, search: categoryMatch[0].toLowerCase(), categorySearch: true };
+    }
+    // Non-category short product mention
     if (!nonProductWords.test(cleanMsg) && cleanMsg.length >= 3) {
       const expanded = expandProductSearchTerm(cleanMsg);
       return { needed: true, search: expanded || cleanMsg };
@@ -3156,54 +3217,40 @@ function expandProductSearchTerm(term) {
  * Used when the primary search returns nothing — tries broader terms before giving up.
  */
 async function multiTermProductSearch(tenantId, subscriptionPlan, primaryTerm) {
-  const tried = new Set();
-  const allProducts = [];
+  const needle   = primaryTerm.toLowerCase().trim();
+  const singular = needle.endsWith('s') && needle.length > 4 ? needle.slice(0, -1) : needle;
+  const expanded = (expandProductSearchTerm(primaryTerm) || '').toLowerCase();
 
-  const trySearch = async (term) => {
-    if (!term || tried.has(term)) return;
-    tried.add(term);
-    const r = await backendApi.listProducts(tenantId, subscriptionPlan, { search: term, limit: 10 }).catch(() => null);
-    if (r?.products?.length) {
-      for (const p of r.products) {
-        if (!allProducts.find(x => x.id === p.id)) allProducts.push(p);
-      }
-    }
-  };
+  // ── Always fetch the full catalog and filter client-side ─────────────────
+  // The backend search param only matches product NAMES.
+  // Category words like "boot", "sandal", "loafer" live in the `category` field —
+  // a name-only backend search will always return 0 results for those terms.
+  // Full catalog fetch + client-side filter is the only reliable approach.
+  const full = await backendApi.listProducts(tenantId, subscriptionPlan, { limit: 100 }).catch(() => null);
+  if (!full?.products?.length) return [];
 
-  // 1. Try the primary term
-  await trySearch(primaryTerm);
+  const matched = full.products.filter(p => {
+    const name = (p.name || '').toLowerCase();
+    const cat  = (p.category || '').toLowerCase();
+    const desc = (p.description || '').toLowerCase();
+    const catSingular = cat.endsWith('s') && cat.length > 3 ? cat.slice(0, -1) : cat;
 
-  // 2. If no results, try expanded/synonym form
-  if (!allProducts.length) {
-    const expanded = expandProductSearchTerm(primaryTerm);
-    if (expanded && expanded !== primaryTerm) await trySearch(expanded);
+    return (
+      name.includes(needle)     || cat.includes(needle)     || desc.includes(needle)     ||
+      name.includes(singular)   || cat.includes(singular)   || desc.includes(singular)   ||
+      catSingular.includes(needle) || catSingular.includes(singular) ||
+      (expanded && (name.includes(expanded) || cat.includes(expanded) || desc.includes(expanded)))
+    );
+  });
+
+  if (matched.length) {
+    console.log(`[multiTermSearch] "${primaryTerm}" → ${matched.length} matches via category/name/desc filter`);
+    return matched;
   }
 
-  // 3. If still nothing, try each individual word (handles "rain boot" → "rain", "boot")
-  if (!allProducts.length && primaryTerm.includes(' ')) {
-    for (const word of primaryTerm.split(' ')) {
-      if (word.length >= 3) await trySearch(word);
-    }
-  }
-
-  // 4. Last resort: fetch full catalog and filter client-side
-  if (!allProducts.length) {
-    const all = await backendApi.listProducts(tenantId, subscriptionPlan, { limit: 30 }).catch(() => null);
-    if (all?.products?.length) {
-      const needle = primaryTerm.toLowerCase();
-      const expanded = (expandProductSearchTerm(primaryTerm) || '').toLowerCase();
-      const filtered = all.products.filter(p => {
-        const name = (p.name || '').toLowerCase();
-        const desc = (p.description || '').toLowerCase();
-        const cat  = (p.category || '').toLowerCase();
-        return name.includes(needle) || desc.includes(needle) || cat.includes(needle)
-          || (expanded && (name.includes(expanded) || desc.includes(expanded) || cat.includes(expanded)));
-      });
-      allProducts.push(...filtered);
-    }
-  }
-
-  return allProducts;
+  // Absolute fallback: backend name search for specific brand/product names (not category words)
+  const r = await backendApi.listProducts(tenantId, subscriptionPlan, { search: primaryTerm, limit: 10 }).catch(() => null);
+  return r?.products || [];
 }
 
 function isBookingIntentMessage(message = '') {
