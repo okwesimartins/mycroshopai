@@ -523,19 +523,16 @@ async function processMessage(messageData) {
           log('preload', `Category search for "${searchTerm}" — fetching full catalog for client-side filter`);
           const fullCatalog = await backendApi.listProducts(tenantId, subscriptionPlan, { limit: 50 });
           if (fullCatalog?.products?.length) {
-            const needle = searchTerm.toLowerCase().replace(/s$/, ''); // "boots" → "boot", "sandals" → "sandal"
+            const needle  = stemCategoryWord(searchTerm); // "boots" → "boot", "sandals" → "sandal", "derbies" → "derby"
+            const needleR = searchTerm.toLowerCase();     // also try raw term for exact matches
             const matched = fullCatalog.products.filter(p => {
               const name = (p.name || '').toLowerCase();
-              const cat  = (p.category || '').toLowerCase();
+              const cat  = stemCategoryWord(p.category || '');
+              const catR = (p.category || '').toLowerCase();
               const desc = (p.description || '').toLowerCase();
-              return name.includes(needle) || cat.includes(needle) || desc.includes(needle)
-                // Also try with trailing s stripped from product fields (boot matches boots)
-                || cat.replace(/s$/, '').includes(needle)
-                || needle.replace(/s$/, '') !== needle && (
-                    name.includes(needle.replace(/s$/, '')) ||
-                    cat.includes(needle.replace(/s$/, '')) ||
-                    desc.includes(needle.replace(/s$/, ''))
-                  );
+              return name.includes(needle) || name.includes(needleR)
+                || cat.includes(needle)   || catR.includes(needleR)
+                || desc.includes(needle)  || desc.includes(needleR);
             });
             products = matched.length ? matched : fullCatalog.products; // fallback to full catalog if no category match
             log('preload', `Category filter "${searchTerm}": ${matched.length}/${fullCatalog.products.length} products matched`);
@@ -559,13 +556,16 @@ async function processMessage(messageData) {
             log('preload', `Name search "${searchTerm}" empty — trying full catalog category filter`);
             const fullCatalog = await backendApi.listProducts(tenantId, subscriptionPlan, { limit: 50 });
             if (fullCatalog?.products?.length) {
-              const needle = searchTerm.toLowerCase().replace(/s$/, '');
+              const needle  = stemCategoryWord(searchTerm);
+              const needleR = searchTerm.toLowerCase();
               const matched = fullCatalog.products.filter(p => {
                 const name = (p.name || '').toLowerCase();
-                const cat  = (p.category || '').toLowerCase();
+                const cat  = stemCategoryWord(p.category || '');
+                const catR = (p.category || '').toLowerCase();
                 const desc = (p.description || '').toLowerCase();
-                return name.includes(needle) || cat.includes(needle) || desc.includes(needle)
-                  || cat.replace(/s$/, '').includes(needle);
+                return name.includes(needle) || name.includes(needleR)
+                  || cat.includes(needle)   || catR.includes(needleR)
+                  || desc.includes(needle)  || desc.includes(needleR);
               });
               products = matched.length ? matched : null;
               log('preload', `Fallback category filter "${needle}": ${matched.length} matches`);
@@ -3091,9 +3091,10 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
 
   // Words that TERMINATE the product name — everything after these is not the product
   // e.g. "sneakers AND the variations" → stop at "and", searchTerm = "sneakers"
-  const stopWords = /^(and|with|or|but|for|variations?|options?|sizes?|colors?|colours?|pictures?|photos?|images?|please|thanks?)$/i;
+  // Also includes conversational connectors: "boots you have", "sandals in stock", "shoes do you have"
+  const stopWords = /^(and|with|or|but|for|variations?|options?|sizes?|colors?|colours?|pictures?|photos?|images?|please|thanks?|you|have|got|are|there|do|we|they|i|available|stock|store|right|now|currently|today|here|us|our)$/i;
   // Words to skip entirely (articles, possessives that appear inside the product phrase)
-  const skipTerms = /^(me|your|the|a|an|any|some|picture|photo|image|catalog|products|items|stuff|price|prices|touch|of|in|type|kind|style|color|colour|colors|colours)$/i;
+  const skipTerms = /^(me|your|the|a|an|any|some|picture|photo|image|catalog|products|items|stuff|price|prices|touch|of|in|type|kind|style|color|colour|colors|colours|see|show|get|find|looking|need|want)$/i;
 
   const specificPatterns = [
     /(?:can i see|show me|you have|do you have|got any|any|see|find|need|want|looking for)\s+(?:the\s+|some\s+|a\s+|your\s+)?([a-z][a-z0-9 ]{1,40}?)(?:\?|$|\.|please|,|\band\b)/i,
@@ -3121,7 +3122,8 @@ function detectInventoryIntent(message, conversationHistory, orderState) {
         const colorHint = colorMatches ? colorMatches.join(', ') : null;
         const wantsVariations = /\b(variation|option|size|color|colour)s?\b/i.test(message);
         // If the extracted term is a category word, flag it so pre-fetch uses full-catalog filter
-        const categoryWordPattern = /^(boot|boots|sandal|sandals|sneaker|sneakers|loafer|loafers|clog|clogs|croc|crocs|oxford|oxfords|slipper|slippers|heel|heels|flat|flats|pump|pumps|mule|mules|slide|slides|trainer|trainers|shoe|shoes)$/i;
+        // Match singular OR plural — normalise to singular for matching
+        const categoryWordPattern = /^(boots?|sandals?|sneakers?|loafers?|clogs?|crocs?|oxfords?|slippers?|heels?|flats?|pumps?|mules?|slides?|trainers?|shoes?|wedges?|stilettos?|espadrilles?|mocassins?|mocasins?|derbies|derby|brogues?|monkstraps?|flip.?flops?|footwear|kicks?|joggers?|runners?|canvas|cloth|fabric)$/i;
         const isCategoryWord = categoryWordPattern.test(searchTerm);
         return { needed: true, search: searchTerm, colorHint, wantsVariations, categorySearch: isCategoryWord };
       }
@@ -3501,6 +3503,25 @@ function extractDateFromMessage(message = '') {
 }
 
 /** Format products as readable text for prompt injection into Gemini */
+/**
+ * stemCategoryWord — reduce a category search word to its root so plural/singular
+ * mismatches don't cause false "no products found" responses.
+ * Handles the most common English plural forms for fashion/footwear categories.
+ * "boots" → "boot", "sandals" → "sandal", "stilettos" → "stiletto", "derbies" → "derby"
+ */
+function stemCategoryWord(word) {
+  const w = word.toLowerCase().trim();
+  if (!w) return w;
+  // ies → y  (derbies → derby, loafers stays loafer)
+  if (w.endsWith('ies') && w.length > 4) return w.slice(0, -3) + 'y';
+  // ves → f or ve  (not common in categories, skip)
+  // es → e  (stilettoes → stiletto, clogs stays clogs → handled by s rule)
+  if (w.endsWith('oes') && w.length > 4) return w.slice(0, -2); // stilettoes → stiletto
+  // trailing s  (boots → boot, sandals → sandal, sneakers → sneaker)
+  if (w.endsWith('s') && w.length > 3) return w.slice(0, -1);
+  return w;
+}
+
 function formatProductsForPrompt(products) {
   return products.slice(0, 20).map((p, i) => {
     const { line } = priceStock(p);
