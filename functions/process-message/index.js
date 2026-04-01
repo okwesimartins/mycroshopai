@@ -502,6 +502,7 @@ async function processMessage(messageData) {
     let inventoryText = null;
     let prefetchedProducts = null; // cached from pre-fetch — passed to action handlers to avoid double backend calls
     let forcedProductName = null;
+    let noProductsFound = false; // set true when catalog returns empty — used to add anti-hallucination guard
     // For incoming images, always pre-fetch the full catalog so Gemini can match the photo to a product
     const inventoryIntent = incomingImageData
       ? { needed: true, search: null, isImageSearch: true }
@@ -583,6 +584,7 @@ async function processMessage(messageData) {
           log('preload', `${products.length} products injected (search: "${searchTerm || 'all'}", category: ${!!inventoryIntent.categorySearch}, contextual: ${!!inventoryIntent.contextual})`);
         } else {
           inventoryText = '[No products found in catalog right now]';
+          noProductsFound = true;
           log('preload', `no products found for "${searchTerm || 'all'}"`);
         }
       } catch (e) {
@@ -612,6 +614,16 @@ async function processMessage(messageData) {
         'INSTRUCTION: Customer has sent a photo. Identify the product in the image and match it to the catalog below. ' +
         'If matched: show that product with query_inventory + show_variations. ' +
         'If unsure: ask "Is this [your best guess]?" and emit query_inventory for that product.';
+    }
+
+    // Anti-hallucination guard: when catalog returned nothing, explicitly stop Gemini
+    // from inventing products from its training knowledge.
+    if (noProductsFound) {
+      const noProductsGuard =
+        'CRITICAL: The catalog search returned no results. ' +
+        'You MUST NOT invent, recall, or guess any product names, prices, or stock levels. ' +
+        'Tell the customer you don\'t carry that item and ask what else they\'re looking for.';
+      inventoryMeta = inventoryMeta ? inventoryMeta + '\n' + noProductsGuard : noProductsGuard;
     }
 
     // Resolve quoted message — when customer replies to a specific message ("I want this")
@@ -688,6 +700,18 @@ async function processMessage(messageData) {
         }
         return a;
       });
+    }
+
+    // Prevent catalog dump alongside a specific product query.
+    // When query_inventory is present the customer asked for ONE product —
+    // showing the full catalog at the same time confuses them and lengthens the journey.
+    const hasQueryInventory = actionsToRun.some(a => a.type === 'query_inventory');
+    if (hasQueryInventory) {
+      const before = actionsToRun.length;
+      actionsToRun = actionsToRun.filter(a => a.type !== 'list_inventory');
+      if (actionsToRun.length < before) {
+        log('action-filter', `Dropped list_inventory alongside query_inventory — specific product takes priority`);
+      }
     }
 
     for (const action of actionsToRun) {
