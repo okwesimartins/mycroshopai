@@ -567,7 +567,17 @@ async function processMessage(messageData) {
                   || cat.includes(needle)   || catR.includes(needleR)
                   || desc.includes(needle)  || desc.includes(needleR);
               });
-              products = matched.length ? matched : null;
+              if (matched.length) {
+                products = matched;
+              } else {
+                // Last resort: fuzzy word-level match handles partial names + misspellings
+                // e.g. "doctor martin" → "Docter Martin Boot" (1-char edit distance)
+                const fuzzyMatched = fullCatalog.products.filter(p => fuzzyProductMatch(searchTerm, p));
+                if (fuzzyMatched.length) {
+                  products = fuzzyMatched;
+                  log('preload', `Fuzzy fallback "${searchTerm}": ${fuzzyMatched.length} matches`);
+                }
+              }
               log('preload', `Fallback category filter "${needle}": ${matched.length} matches`);
             }
           } else {
@@ -3274,6 +3284,14 @@ async function multiTermProductSearch(tenantId, subscriptionPlan, primaryTerm) {
     return matched;
   }
 
+  // Fuzzy fallback — handles partial names and 1-char misspellings
+  // e.g. "doctor martin" → "Docter Martin Boot", "air force" → "Air Force 1"
+  const fuzzyMatched = full.products.filter(p => fuzzyProductMatch(primaryTerm, p));
+  if (fuzzyMatched.length) {
+    console.log(`[multiTermSearch] "${primaryTerm}" → ${fuzzyMatched.length} fuzzy matches`);
+    return fuzzyMatched;
+  }
+
   // Absolute fallback: backend name search for specific brand/product names (not category words)
   const r = await backendApi.listProducts(tenantId, subscriptionPlan, { search: primaryTerm, limit: 10 }).catch(() => null);
   return r?.products || [];
@@ -3509,6 +3527,54 @@ function extractDateFromMessage(message = '') {
  * Handles the most common English plural forms for fashion/footwear categories.
  * "boots" → "boot", "sandals" → "sandal", "stilettos" → "stiletto", "derbies" → "derby"
  */
+/**
+ * levenshteinDistance — edit distance between two strings.
+ * Used for fuzzy product name matching ("doctor" ↔ "docter", "air force" ↔ "airforce").
+ * Returns the number of single-character edits needed.
+ */
+function levenshteinDistance(a, b) {
+  const m = a.length, n = b.length;
+  if (Math.abs(m - n) > 3) return 99; // quick bail for very different lengths
+  const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+
+/**
+ * fuzzyProductMatch — checks if ALL words from the customer's search term
+ * appear (with ≤1 edit distance tolerance) anywhere in a product's name/category/description.
+ *
+ * Examples:
+ *   "doctor martin"  → matches "Docter Martin Boot"  (doctor≈docter, martin=martin)
+ *   "air force"      → matches "Air Force 1"          (exact)
+ *   "jordan"         → matches "Jordan 1 Retro"        (exact)
+ *
+ * Short words (≤3 chars) require an exact match to avoid false positives.
+ */
+function fuzzyProductMatch(searchTerm, product) {
+  const productText = [product.name, product.category, product.description]
+    .filter(Boolean).join(' ').toLowerCase();
+  const productWords = productText.split(/\W+/).filter(w => w.length > 1);
+
+  const searchWords = searchTerm.toLowerCase().split(/\s+/).filter(w => w.length > 1);
+  if (!searchWords.length) return false;
+
+  return searchWords.every(sw => {
+    // Exact substring first (fast path)
+    if (productText.includes(sw)) return true;
+    // Fuzzy word match — allow 1 edit for words ≥ 5 chars, 0 edits for short words
+    const maxDist = sw.length >= 5 ? 1 : 0;
+    return productWords.some(pw => levenshteinDistance(sw, pw) <= maxDist);
+  });
+}
+
 function stemCategoryWord(word) {
   const w = word.toLowerCase().trim();
   if (!w) return w;
