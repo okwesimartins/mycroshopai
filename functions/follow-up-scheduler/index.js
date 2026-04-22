@@ -1,569 +1,570 @@
-const functions = require('@google-cloud/functions-framework');
-const { getFirestore, FieldValue } = require('firebase-admin/firestore');
-const { initializeApp } = require('firebase-admin/app');
-const admin = require('firebase-admin');
-const whatsapp = require('../../lib/whatsapp');
-const database = require('../../lib/database');
+/**
+ * Follow-Up Scheduler — Intelligent, analytics-driven
+ *
+ * Algorithm overview:
+ *   1. Load all active tenants (those with WhatsApp connections in MySQL).
+ *   2. For each tenant, load every conversation from Firestore.
+ *   3. Run the analytics scoring engine on each conversation — produces a
+ *      numeric score + category (abandoned_cart, hot_lead, warm_lead, etc.).
+ *   4. Sort by priority score descending.
+ *   5. For each eligible conversation:
+ *        a. Check if a follow-up was already sent recently (cooldown).
+ *        b. Call POST /api/v1/whatsapp-plans/agent/use-followup to consume one
+ *           credit and verify the tenant hasn't hit their follow-up limit.
+ *        c. Generate a personalised, context-aware message.
+ *        d. Send via WhatsApp and record in Firestore.
+ *
+ * Triggered via HTTP (Cloud Scheduler fires this endpoint hourly).
+ */
 
-// Initialize Firebase Admin
-if (!admin.apps.length) {
-  initializeApp();
-}
+const functions  = require('@google-cloud/functions-framework');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
+const { initializeApp }            = require('firebase-admin/app');
+const admin      = require('firebase-admin');
+const whatsapp   = require('../../lib/whatsapp');
+const database   = require('../../lib/database');
+const backendApi = require('../../lib/backend-api');
+
+if (!admin.apps.length) initializeApp();
 const db = getFirestore();
 
-/**
- * Follow-Up Scheduler Function
- * Runs on schedule (every hour) to send follow-up messages
- * Like a human sales agent would follow up with customers
- */
-functions.http('followUpScheduler', async (req, res) => {
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const FOLLOW_UP_COOLDOWNS = {
+  abandoned_cart:   30 * 60 * 1000,        // 30 minutes between attempts
+  hot_leads:        60 * 60 * 1000,        // 1 hour
+  warm_leads:       3  * 60 * 60 * 1000,   // 3 hours
+  price_inquirers:  24 * 60 * 60 * 1000,   // 24 hours
+  browsers:         72 * 60 * 60 * 1000,   // 3 days
+  completed_sales:  72 * 60 * 60 * 1000,   // 3 days
+};
+
+const MAX_FOLLOW_UPS_PER_CUSTOMER = {
+  abandoned_cart:  4,
+  hot_leads:       3,
+  warm_leads:      3,
+  price_inquirers: 2,
+  browsers:        1,
+  completed_sales: 1,
+};
+
+// ─── Main Handler ─────────────────────────────────────────────────────────────
+
+functions.http('followUpScheduler', async (_req, res) => {
+  const log = (...a) => console.log('[follow-up]', ...a);
+
   try {
-    console.log('Follow-up scheduler started');
+    log('Scheduler started');
 
-    // Get all pending follow-ups that are due
-    const now = new Date();
-    const followUps = await getPendingFollowUps(now);
+    const tenants = await getActiveTenants();
+    log(`Processing ${tenants.length} tenants`);
 
-    console.log(`Found ${followUps.length} follow-ups to send`);
+    const summary = { tenants: tenants.length, analyzed: 0, sent: 0, skipped: 0, errors: 0 };
 
-    const results = {
-      processed: 0,
-      sent: 0,
-      failed: 0,
-      errors: []
-    };
-
-    for (const followUp of followUps) {
+    for (const tenant of tenants) {
       try {
-        const sent = await processFollowUp(followUp);
-        
-        if (sent) {
-          results.sent++;
-          // Mark as sent
-          await updateFollowUpStatus(followUp.id, 'sent');
-        } else {
-          results.failed++;
-        }
-        
-        results.processed++;
-      } catch (error) {
-        console.error(`Error processing follow-up ${followUp.id}:`, error);
-        results.failed++;
-        results.errors.push({
-          followUpId: followUp.id,
-          error: error.message
-        });
+        const result = await processTenantFollowUps(tenant);
+        summary.analyzed += result.analyzed;
+        summary.sent     += result.sent;
+        summary.skipped  += result.skipped;
+        summary.errors   += result.errors;
+      } catch (err) {
+        console.error(`[follow-up] Tenant ${tenant.tenant_id} error:`, err.message);
+        summary.errors++;
       }
     }
 
-    // Also check for new follow-ups to schedule
-    await scheduleNewFollowUps();
+    log('Scheduler complete:', summary);
+    return res.json({ success: true, summary });
 
-    return res.json({
-      success: true,
-      message: 'Follow-up scheduler completed',
-      results
-    });
-  } catch (error) {
-    console.error('Follow-up scheduler error:', error);
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
+  } catch (err) {
+    console.error('[follow-up] Fatal error:', err);
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
+// ─── Tenant Processing ────────────────────────────────────────────────────────
+
+async function processTenantFollowUps(tenant) {
+  const { tenant_id, phone_number_id, access_token, store_name } = tenant;
+  const log = (...a) => console.log(`[follow-up:${tenant_id}]`, ...a);
+  const result = { analyzed: 0, sent: 0, skipped: 0, errors: 0 };
+
+  // Load all conversations for this tenant
+  const conversations = await loadTenantConversations(tenant_id);
+  log(`${conversations.length} conversations loaded`);
+
+  // Run analytics and sort by priority
+  const analyzed = conversations
+    .map(conv => ({ ...conv, analytics: analyzeConversation(conv) }))
+    .filter(c => c.analytics.followUpEligible)
+    .sort((a, b) => b.analytics.score - a.analytics.score);
+
+  result.analyzed = conversations.length;
+  log(`${analyzed.length} follow-up eligible after analytics`);
+
+  for (const conv of analyzed) {
+    try {
+      const { customer_phone, analytics } = conv;
+
+      // Check cooldown — don't bombard customers
+      const lastFollowUp = await getLastFollowUpTime(tenant_id, customer_phone);
+      const cooldown = FOLLOW_UP_COOLDOWNS[analytics.category] || 24 * 60 * 60 * 1000;
+      if (lastFollowUp && (Date.now() - lastFollowUp) < cooldown) {
+        log(`Skipping ${customer_phone} — cooldown active (${analytics.category})`);
+        result.skipped++;
+        continue;
+      }
+
+      // Check max follow-ups per customer
+      const followUpCount = await getFollowUpCount(tenant_id, customer_phone);
+      const maxFollowUps = MAX_FOLLOW_UPS_PER_CUSTOMER[analytics.category] || 2;
+      if (followUpCount >= maxFollowUps) {
+        log(`Skipping ${customer_phone} — max follow-ups reached (${followUpCount}/${maxFollowUps})`);
+        result.skipped++;
+        continue;
+      }
+
+      // ── Check follow-up limit with the billing API ────────────────────
+      const limitCheck = await backendApi.checkFollowUpLimit(tenant_id);
+      if (!limitCheck.allowed) {
+        log(`Tenant ${tenant_id} follow-up limit reached: ${limitCheck.reason || limitCheck.message}`);
+        // Stop processing this tenant entirely — limit is global per tenant
+        break;
+      }
+
+      // Generate the follow-up message
+      const message = generateFollowUpMessage(analytics, conv, store_name);
+      if (!message) { result.skipped++; continue; }
+
+      // Send via WhatsApp
+      await whatsapp.sendMessage(phone_number_id, access_token, customer_phone, message);
+
+      // Record in Firestore
+      await recordFollowUp(tenant_id, customer_phone, analytics.category, message, analytics);
+
+      log(`Sent ${analytics.category} follow-up to ${customer_phone} (score: ${analytics.score})`);
+      result.sent++;
+
+    } catch (err) {
+      console.error(`[follow-up:${tenant_id}] Error for ${conv.customer_phone}:`, err.message);
+      result.errors++;
+    }
+  }
+
+  return result;
+}
+
+// ─── Analytics Engine ─────────────────────────────────────────────────────────
+
 /**
- * Get pending follow-ups that are due to be sent
+ * analyzeConversation — scores a conversation and assigns a category.
+ *
+ * Score = sum of signals × time decay factor
+ * Higher score = higher follow-up priority.
  */
-async function getPendingFollowUps(now) {
+function analyzeConversation(conv) {
+  const { messages = [], order_state = 'idle', pending_order = null } = conv;
+
+  let rawScore = 0;
+  const signals = [];
+
+  // ── Order state signals (highest weight) ────────────────────────────
+  if (order_state === 'awaiting_payment' && pending_order?.order_id) {
+    rawScore += 35; signals.push('awaiting_payment');
+  } else if (order_state === 'awaiting_payment') {
+    rawScore += 25; signals.push('awaiting_payment_no_order');
+  } else if (order_state === 'collecting_details') {
+    rawScore += 25; signals.push('collecting_details');
+  } else if (order_state === 'pending_approval') {
+    rawScore += 15; signals.push('receipt_submitted');
+  } else if (order_state === 'complete' || order_state === 'booking_complete') {
+    rawScore += 5;  signals.push('completed_sale');
+  }
+
+  if (!messages.length) {
+    return { score: 0, rawScore: 0, signals, category: 'browsers', followUpEligible: false,
+             productOfInterest: null, hoursSinceLast: 999 };
+  }
+
+  // Build search text from user messages only
+  const userText = messages
+    .filter(m => m.role === 'user')
+    .map(m => (m.text || '').toLowerCase())
+    .join(' ');
+
+  // ── Intent signals ────────────────────────────────────────────────────
+  if (/\bi want\b|\bi need\b|\border\b|\bbuy\b|\bpurchase\b|\bpay\b/.test(userText)) {
+    rawScore += 20; signals.push('buy_intent');
+  }
+  if (/how much|price|cost|₦|naira/.test(userText)) {
+    rawScore += 20; signals.push('price_inquiry');
+  }
+  if (/picture|photo|image|show me|let me see/.test(userText)) {
+    rawScore += 15; signals.push('product_image_request');
+  }
+  if (/last price|discount|abeg|too expensive|cheaper|budget/.test(userText)) {
+    rawScore += 10; signals.push('price_negotiation');
+  }
+  if (/size|color|colour|variant|option/.test(userText)) {
+    rawScore += 8;  signals.push('variant_inquiry');
+  }
+
+  // ── Engagement depth ──────────────────────────────────────────────────
+  const turnCount = messages.length;
+  if (turnCount >= 10) { rawScore += 8;  signals.push('high_engagement'); }
+  else if (turnCount >= 5) { rawScore += 4; }
+
+  // ── Opt-out / negative signals (eliminates follow-up entirely) ────────
+  if (/not interested|wrong number|\bstop\b|remove me|unsubscribe|don't contact/.test(userText)) {
+    return { score: 0, rawScore: 0, signals: ['opted_out'], category: 'opted_out',
+             followUpEligible: false, productOfInterest: null, hoursSinceLast: 0 };
+  }
+
+  // ── Time since last user message ──────────────────────────────────────
+  const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+  const lastAt = lastUserMsg?.timestamp ? new Date(lastUserMsg.timestamp) : null;
+  const hoursSinceLast = lastAt ? (Date.now() - lastAt.getTime()) / (1000 * 60 * 60) : 999;
+
+  // Time decay factor — older conversations get lower priority
+  let timeFactor;
+  if      (hoursSinceLast > 168) timeFactor = 0;     // > 7 days
+  else if (hoursSinceLast > 72)  timeFactor = 0.20;  // 3–7 days
+  else if (hoursSinceLast > 24)  timeFactor = 0.50;  // 1–3 days
+  else if (hoursSinceLast > 6)   timeFactor = 0.75;  // 6–24 hrs
+  else if (hoursSinceLast > 1)   timeFactor = 0.90;  // 1–6 hrs
+  else                           timeFactor = 1.0;   // < 1 hr
+
+  const score = Math.round(rawScore * timeFactor);
+
+  // ── Category assignment ───────────────────────────────────────────────
+  let category;
+  let followUpEligible = timeFactor > 0;
+
+  if (signals.includes('completed_sale')) {
+    category = 'completed_sales';
+    followUpEligible = hoursSinceLast >= 48 && hoursSinceLast <= 120; // post-purchase window
+  } else if (signals.includes('receipt_submitted')) {
+    category = 'pending_approval';
+    followUpEligible = false; // system handles this, not follow-up scheduler
+  } else if (signals.includes('awaiting_payment') && pending_order?.order_id) {
+    category = 'abandoned_cart';
+  } else if (score >= 60 || (signals.includes('buy_intent') && signals.includes('price_inquiry'))) {
+    category = 'hot_leads';
+  } else if (score >= 30 || signals.includes('buy_intent') || signals.includes('collecting_details')) {
+    category = 'warm_leads';
+  } else if (signals.includes('price_inquiry') && !signals.includes('buy_intent')) {
+    category = 'price_inquirers';
+  } else if (hoursSinceLast > 72) {
+    category = 'cold_leads';
+    followUpEligible = false; // cold leads don't get automated follow-ups
+  } else {
+    category = 'browsers';
+  }
+
+  const productOfInterest = extractProductOfInterest(messages);
+  const customerName      = extractCustomerName(messages, pending_order);
+
+  return {
+    score, rawScore, timeFactor, signals, category,
+    followUpEligible,
+    hoursSinceLast: Math.round(hoursSinceLast * 10) / 10,
+    productOfInterest,
+    customerName,
+  };
+}
+
+// ─── Message Generation ───────────────────────────────────────────────────────
+
+function generateFollowUpMessage(analytics, conv, storeName) {
+  const { category, productOfInterest, customerName } = analytics;
+  const { pending_order } = conv;
+  const store  = storeName || 'the store';
+  const name   = customerName ? customerName.split(' ')[0] : null; // first name only
+  const product = productOfInterest;
+  const greeting = name ? `Hey ${name}` : 'Hey';
+
+  switch (category) {
+
+    case 'abandoned_cart': {
+      const followUpNum = conv._followUpCount || 0;
+      const amount      = pending_order?.total_amount
+        ? `₦${parseFloat(pending_order.total_amount).toLocaleString()}` : null;
+
+      if (followUpNum === 0) {
+        // First nudge — soft and helpful
+        return `${greeting} 👋 just checking in — your ${product ? `order for the ${product}` : 'order'} is still waiting for payment.`
+          + (amount ? ` Total is ${amount}.` : '')
+          + ` Let me know if you need help sorting it out.`;
+      }
+      if (followUpNum === 1) {
+        // Second nudge — add mild urgency
+        return `${greeting}, the ${product || 'item'} you ordered is still reserved for you.`
+          + (amount ? ` Just send in your payment of ${amount} to confirm.` : ` Send your payment to confirm.`)
+          + ` We hold for 24hrs max after that it goes back to stock.`;
+      }
+      if (followUpNum === 2) {
+        // Third nudge — final push
+        return `Last reminder ${name ? name : ''} — your ${product || 'order'} is about to be released back into stock.`
+          + ` Tap here to sort the payment and lock it in.`;
+      }
+      return null; // max attempts reached
+    }
+
+    case 'hot_leads': {
+      const followUpNum = conv._followUpCount || 0;
+      if (followUpNum === 0) {
+        return product
+          ? `${greeting} 👋 you were looking at the ${product} earlier — it's still available. Want me to lock one in for you?`
+          : `${greeting} 👋 you were close to placing an order earlier. Still interested? I can sort it out for you right now.`;
+      }
+      if (followUpNum === 1) {
+        return product
+          ? `Still thinking about the ${product}? ${name ? name : 'We'} can have it sorted and on its way quickly.`
+          : `Still here if you need me. Just say the word and I'll get your order going.`;
+      }
+      return null;
+    }
+
+    case 'warm_leads': {
+      const followUpNum = conv._followUpCount || 0;
+      if (followUpNum === 0) {
+        return product
+          ? `${greeting} 👋 the ${product} you checked out earlier is still available at ${store}. Want more details or ready to order?`
+          : `${greeting} 👋 just checking in — anything from ${store} catch your eye? Happy to help you find the right thing.`;
+      }
+      if (followUpNum === 1) {
+        return product
+          ? `The ${product} is still here${name ? `, ${name}` : ''}. Want me to put one aside for you?`
+          : `Still here if you're looking for something specific — just say the word.`;
+      }
+      return null;
+    }
+
+    case 'price_inquirers': {
+      const followUpNum = conv._followUpCount || 0;
+      if (followUpNum === 0) {
+        return product
+          ? `${greeting} 👋 you asked about the ${product} earlier. Still interested? Prices are the same — happy to set one aside for you.`
+          : `${greeting} 👋 you were checking our prices earlier. If budget was a concern, let me know — I can see what options fit.`;
+      }
+      return null;
+    }
+
+    case 'browsers': {
+      return product
+        ? `${greeting} 👋 you were browsing earlier. The ${product} is still in stock if you're still interested.`
+        : `${greeting} 👋 just checking in — anything from ${store} take your eye? Happy to help you find something.`;
+    }
+
+    case 'completed_sales': {
+      const orderNum = pending_order?.order_number;
+      return `${greeting} 🙌 hope your ${product || 'order'}${orderNum ? ` (#${orderNum})` : ''} arrived well.`
+        + ` Let us know if everything is good or if there's anything we can sort out for you.`;
+    }
+
+    default:
+      return null;
+  }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function extractProductOfInterest(messages) {
+  // Walk messages in reverse — most recent product mention wins
+  const pricePattern = /([A-Za-z][A-Za-z0-9 ]{2,30})\s*[-–]\s*(?:from\s+)?₦/g;
+
+  for (const msg of [...messages].reverse()) {
+    const text = msg.text || '';
+    let m;
+    if ((m = pricePattern.exec(text))) return m[1].trim();
+    if (msg.role === 'user') {
+      const lower = text.toLowerCase();
+      const knownPatterns = [
+        /(?:the|a|an)\s+([a-z][a-z0-9 ]{2,30})(?:\s+in|\s+size|\s+color|\s*\?|$)/i,
+        /(?:want|need|order|buy)\s+(?:the\s+)?([a-z][a-z0-9 ]{2,30})/i,
+        /(?:jordan|air max|air force|nike|adidas|puma|vans|converse|loafer|boot|sandal|sneaker|clack|clog)[a-z0-9 ]*/i,
+      ];
+      for (const p of knownPatterns) {
+        if ((m = lower.match(p))) return m[0].replace(/^(want|need|order|buy|the|a|an)\s+/i, '').trim();
+      }
+    }
+  }
+  return null;
+}
+
+function extractCustomerName(messages, pendingOrder) {
+  if (pendingOrder?.customer_name) return pendingOrder.customer_name;
+  // Look for name in conversation (when AI asked "what's your name?")
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role !== 'user') continue;
+    const text = (msg.text || '').trim();
+    // If it's a short message (1-3 words) that comes after the AI asked for name, it might be the name
+    const words = text.split(/\s+/);
+    if (words.length <= 3 && /^[A-Z]/.test(text) && !/^\d/.test(text)) {
+      // Check if previous AI message asked for name
+      const prevAI = messages[i - 1];
+      if (prevAI?.role !== 'user' && /name|who am i/i.test(prevAI?.text || '')) {
+        return text;
+      }
+    }
+  }
+  return null;
+}
+
+// ─── Firestore Helpers ────────────────────────────────────────────────────────
+
+async function loadTenantConversations(tenantId) {
   try {
-    const followUpsRef = db.collectionGroup('follow_ups')
-      .where('status', '==', 'pending')
-      .where('scheduled_at', '<=', now);
+    const convsSnap = await db
+      .collection('tenants').doc(tenantId.toString())
+      .collection('conversations')
+      .get();
 
-    const snapshot = await followUpsRef.get();
-    
-    const followUps = [];
-    snapshot.forEach(doc => {
-      const data = doc.data();
-      followUps.push({
-        id: doc.id,
-        ...data
-      });
-    });
+    const conversations = [];
 
-    return followUps;
-  } catch (error) {
-    console.error('Error getting pending follow-ups:', error);
+    await Promise.all(convsSnap.docs.map(async convDoc => {
+      const customerPhone = convDoc.id;
+      try {
+        const [messagesSnap, orderStateDoc] = await Promise.all([
+          db.collection('tenants').doc(tenantId.toString())
+            .collection('conversations').doc(customerPhone)
+            .collection('messages')
+            .orderBy('timestamp', 'desc')
+            .limit(50)
+            .get(),
+          db.collection('tenants').doc(tenantId.toString())
+            .collection('order_states').doc(customerPhone)
+            .get(),
+        ]);
+
+        const messages = [];
+        messagesSnap.forEach(doc => {
+          const d = doc.data();
+          messages.push({ role: d.role, text: d.message, timestamp: d.timestamp?.toDate?.() || d.createdAt });
+        });
+        messages.reverse(); // oldest first
+
+        const orderState = orderStateDoc.exists ? orderStateDoc.data() : null;
+
+        conversations.push({
+          customer_phone: customerPhone,
+          messages,
+          order_state:   orderState?.state || 'idle',
+          pending_order: orderState?.pending_order || null,
+        });
+      } catch (err) {
+        console.error(`[follow-up] loadConversation error for ${customerPhone}:`, err.message);
+      }
+    }));
+
+    return conversations;
+  } catch (err) {
+    console.error('[follow-up] loadTenantConversations error:', err.message);
     return [];
   }
 }
 
-/**
- * Process a single follow-up
- */
-async function processFollowUp(followUp) {
+async function getLastFollowUpTime(tenantId, customerPhone) {
   try {
-    const { tenant_id, customer_phone, follow_up_type, context } = followUp;
+    const snap = await db
+      .collection('tenants').doc(tenantId.toString())
+      .collection('conversations').doc(customerPhone)
+      .collection('follow_ups')
+      .where('status', '==', 'sent')
+      .orderBy('sent_at', 'desc')
+      .limit(1)
+      .get();
 
-    // Get tenant WhatsApp connection
-    const phoneNumberId = await getPhoneNumberId(tenant_id);
-    const accessToken = await getAccessToken(tenant_id, phoneNumberId);
-
-    if (!phoneNumberId || !accessToken) {
-      console.error(`No WhatsApp connection for tenant ${tenant_id}`);
-      return false;
-    }
-
-    // Generate follow-up message based on type
-    const message = await generateFollowUpMessage(follow_up_type, context, tenant_id);
-
-    if (!message) {
-      console.log(`No message generated for follow-up type: ${follow_up_type}`);
-      return false;
-    }
-
-    // Send message via WhatsApp
-    await whatsapp.sendMessage(phoneNumberId, accessToken, customer_phone, message);
-
-    // Save to conversation history
-    await saveFollowUpMessage(tenant_id, customer_phone, message, follow_up_type);
-
-    console.log(`Follow-up sent to ${customer_phone} for tenant ${tenant_id}`);
-    return true;
-  } catch (error) {
-    console.error('Error processing follow-up:', error);
-    return false;
-  }
-}
-
-/**
- * Generate follow-up message based on type and context
- */
-async function generateFollowUpMessage(followUpType, context, tenantId) {
-  try {
-    switch (followUpType) {
-      case 'abandoned_cart':
-        return generateAbandonedCartMessage(context);
-      
-      case 'payment_pending':
-        return generatePaymentPendingMessage(context);
-      
-      case 'post_purchase':
-        return generatePostPurchaseMessage(context);
-      
-      case 're_engagement':
-        return generateReEngagementMessage(context, tenantId);
-      
-      case 'order_confirmation':
-        return generateOrderConfirmationMessage(context);
-      
-      default:
-        return null;
-    }
-  } catch (error) {
-    console.error('Error generating follow-up message:', error);
+    if (snap.empty) return null;
+    const data = snap.docs[0].data();
+    return data.sent_at?.toDate?.()?.getTime() || null;
+  } catch (err) {
     return null;
   }
 }
 
-/**
- * Generate abandoned cart follow-up message
- */
-function generateAbandonedCartMessage(context) {
-  const { products, order_id } = context;
-  const productList = products.slice(0, 3).join(', ');
-  const moreProducts = products.length > 3 ? ` and ${products.length - 3} more` : '';
-
-  return `Hi! 👋\n\n` +
-         `I noticed you were interested in ${productList}${moreProducts}.\n\n` +
-         `Still interested? I'm here to help you complete your order! 😊\n\n` +
-         `Just reply to this message and I'll assist you.`;
-}
-
-/**
- * Generate payment pending follow-up message
- */
-function generatePaymentPendingMessage(context) {
-  const { order_id, order_number, total_amount, payment_link } = context;
-
-  return `Hi! 💰\n\n` +
-         `Your order #${order_number} is ready!\n\n` +
-         `Total: ₦${parseFloat(total_amount).toLocaleString()}\n\n` +
-         `Complete your payment here:\n${payment_link}\n\n` +
-         `Once payment is confirmed, we'll process your order immediately! 🚀`;
-}
-
-/**
- * Generate post-purchase follow-up message
- */
-function generatePostPurchaseMessage(context) {
-  const { order_number, products } = context;
-  const productList = products.slice(0, 2).join(', ');
-
-  return `Hi! 🎉\n\n` +
-         `I hope you're enjoying your purchase: ${productList}!\n\n` +
-         `Is everything as expected? If you have any questions or need assistance, I'm here to help! 😊\n\n` +
-         `Also, we have some related products you might like. Just ask me!`;
-}
-
-/**
- * Generate re-engagement follow-up message
- */
-async function generateReEngagementMessage(context, tenantId) {
-  // Get new products or offers
-  const newProducts = await getNewProducts(tenantId);
-  
-  if (newProducts.length > 0) {
-    const productList = newProducts.slice(0, 3).map(p => p.name).join(', ');
-    return `Hi! 👋\n\n` +
-           `We have some exciting new products you might like:\n${productList}\n\n` +
-           `Interested? Just reply and I'll tell you more! 😊`;
-  }
-
-  return `Hi! 👋\n\n` +
-         `It's been a while! We'd love to hear from you.\n\n` +
-         `Is there anything I can help you with today? 😊`;
-}
-
-/**
- * Generate order confirmation follow-up
- */
-function generateOrderConfirmationMessage(context) {
-  const { order_number, estimated_delivery } = context;
-
-  return `Hi! ✅\n\n` +
-         `Great news! Your order #${order_number} has been confirmed.\n\n` +
-         `Estimated delivery: ${estimated_delivery}\n\n` +
-         `We'll keep you updated on the status. Thank you for your order! 🙏`;
-}
-
-/**
- * Schedule new follow-ups based on recent activity
- */
-async function scheduleNewFollowUps() {
+async function getFollowUpCount(tenantId, customerPhone) {
   try {
-    // Get recent orders without payment (last 1 hour)
-    const pendingOrders = await getPendingOrders();
-
-    for (const order of pendingOrders) {
-      // Check if follow-up already scheduled
-      const existing = await checkExistingFollowUp(
-        order.tenant_id,
-        order.customer_phone,
-        'payment_pending',
-        order.id
-      );
-
-      if (!existing) {
-        // Schedule follow-ups: 30 min, 2 hours, 1 day
-        await scheduleFollowUp({
-          tenant_id: order.tenant_id,
-          customer_phone: order.customer_phone,
-          follow_up_type: 'payment_pending',
-          scheduled_at: new Date(Date.now() + 30 * 60 * 1000), // 30 minutes
-          context: {
-            order_id: order.id,
-            order_number: order.order_number,
-            total_amount: order.total_amount,
-            payment_link: order.payment_link
-          }
-        });
-
-        // Schedule 2-hour follow-up
-        await scheduleFollowUp({
-          tenant_id: order.tenant_id,
-          customer_phone: order.customer_phone,
-          follow_up_type: 'payment_pending',
-          scheduled_at: new Date(Date.now() + 2 * 60 * 60 * 1000), // 2 hours
-          context: {
-            order_id: order.id,
-            order_number: order.order_number,
-            total_amount: order.total_amount,
-            payment_link: order.payment_link
-          }
-        });
-      }
-    }
-
-    // Get abandoned carts (orders created but no payment initiated in 1 hour)
-    const abandonedCarts = await getAbandonedCarts();
-
-    for (const cart of abandonedCarts) {
-      const existing = await checkExistingFollowUp(
-        cart.tenant_id,
-        cart.customer_phone,
-        'abandoned_cart',
-        cart.id
-      );
-
-      if (!existing) {
-        // Schedule follow-ups: 1 hour, 24 hours, 3 days
-        await scheduleFollowUp({
-          tenant_id: cart.tenant_id,
-          customer_phone: cart.customer_phone,
-          follow_up_type: 'abandoned_cart',
-          scheduled_at: new Date(Date.now() + 60 * 60 * 1000), // 1 hour
-          context: {
-            order_id: cart.id,
-            products: cart.items.map(i => i.product_name)
-          }
-        });
-      }
-    }
-
-    // Get inactive customers (no message in 7+ days)
-    const inactiveCustomers = await getInactiveCustomers();
-
-    for (const customer of inactiveCustomers) {
-      const existing = await checkExistingFollowUp(
-        customer.tenant_id,
-        customer.phone,
-        're_engagement',
-        null
-      );
-
-      if (!existing) {
-        // Schedule weekly re-engagement
-        await scheduleFollowUp({
-          tenant_id: customer.tenant_id,
-          customer_phone: customer.phone,
-          follow_up_type: 're_engagement',
-          scheduled_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
-          context: {
-            last_message_at: customer.last_message_at
-          }
-        });
-      }
-    }
-  } catch (error) {
-    console.error('Error scheduling new follow-ups:', error);
-  }
-}
-
-/**
- * Schedule a follow-up
- */
-async function scheduleFollowUp(followUpData) {
-  try {
-    const followUpRef = db
-      .collection('tenants')
-      .doc(followUpData.tenant_id.toString())
-      .collection('conversations')
-      .doc(followUpData.customer_phone)
+    const snap = await db
+      .collection('tenants').doc(tenantId.toString())
+      .collection('conversations').doc(customerPhone)
       .collection('follow_ups')
-      .doc();
-
-    await followUpRef.set({
-      ...followUpData,
-      status: 'pending',
-      created_at: FieldValue.serverTimestamp(),
-      updated_at: FieldValue.serverTimestamp()
-    });
-
-    console.log(`Follow-up scheduled for ${followUpData.customer_phone}`);
-  } catch (error) {
-    console.error('Error scheduling follow-up:', error);
-    throw error;
+      .where('status', '==', 'sent')
+      .get();
+    return snap.size;
+  } catch (err) {
+    return 0;
   }
 }
 
-/**
- * Check if follow-up already exists
- */
-async function checkExistingFollowUp(tenantId, customerPhone, followUpType, contextId) {
-  try {
-    const followUpsRef = db
-      .collection('tenants')
-      .doc(tenantId.toString())
-      .collection('conversations')
-      .doc(customerPhone)
-      .collection('follow_ups')
-      .where('follow_up_type', '==', followUpType)
-      .where('status', 'in', ['pending', 'sent']);
+async function recordFollowUp(tenantId, customerPhone, category, message, analytics) {
+  const convRef = db
+    .collection('tenants').doc(tenantId.toString())
+    .collection('conversations').doc(customerPhone);
 
-    const snapshot = await followUpsRef.get();
-    
-    if (contextId) {
-      // Check if same context (e.g., same order)
-      for (const doc of snapshot.docs) {
-        const data = doc.data();
-        if (data.context?.order_id === contextId) {
-          return true;
-        }
-      }
-    } else {
-      // Check if any follow-up of this type exists
-      return !snapshot.empty;
-    }
+  const batch = db.batch();
 
-    return false;
-  } catch (error) {
-    console.error('Error checking existing follow-up:', error);
-    return false;
-  }
+  // Record the follow-up entry
+  const followUpRef = convRef.collection('follow_ups').doc();
+  batch.set(followUpRef, {
+    status:    'sent',
+    category,
+    message,
+    score:     analytics.score,
+    signals:   analytics.signals,
+    sent_at:   FieldValue.serverTimestamp(),
+    created_at: FieldValue.serverTimestamp(),
+  });
+
+  // Save to conversation history so it appears in chat view
+  const msgRef = convRef.collection('messages').doc();
+  batch.set(msgRef, {
+    role:        'assistant',
+    message,
+    messageType: 'follow_up',
+    followUpCategory: category,
+    timestamp:   FieldValue.serverTimestamp(),
+    createdAt:   new Date(),
+  });
+
+  // Update conversation metadata
+  batch.set(convRef, {
+    lastMessage:     message,
+    lastMessageRole: 'assistant',
+    lastMessageAt:   FieldValue.serverTimestamp(),
+    updatedAt:       FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  await batch.commit();
 }
 
-/**
- * Update follow-up status
- */
-async function updateFollowUpStatus(followUpId, status) {
-  try {
-    // Note: followUpId includes path, need to parse it
-    // For simplicity, we'll use a different approach
-    // In production, store follow-up ID with full path
-    return true;
-  } catch (error) {
-    console.error('Error updating follow-up status:', error);
-  }
-}
+// ─── Tenant Loader ────────────────────────────────────────────────────────────
 
-/**
- * Get phone number ID for tenant
- */
-async function getPhoneNumberId(tenantId) {
+async function getActiveTenants() {
   try {
     const pool = await database.initializeMainDb();
-    const [rows] = await pool.execute(
-      'SELECT phone_number_id FROM whatsapp_connections WHERE tenant_id = ? LIMIT 1',
-      [tenantId]
-    );
+    const [rows] = await pool.execute(`
+      SELECT
+        wc.tenant_id,
+        wc.phone_number_id,
+        wc.access_token,
+        t.name AS store_name
+      FROM whatsapp_connections wc
+      JOIN tenants t ON t.id = wc.tenant_id
+      WHERE wc.access_token IS NOT NULL
+        AND wc.phone_number_id IS NOT NULL
+    `);
 
-    if (rows.length > 0) {
-      return rows[0].phone_number_id;
-    }
-
-    return null;
-  } catch (error) {
-    console.error('Error getting phone number ID:', error);
-    return null;
-  }
-}
-
-/**
- * Get access token for tenant
- */
-async function getAccessToken(tenantId, phoneNumberId) {
-  try {
-    const pool = await database.initializeMainDb();
-    const [rows] = await pool.execute(
-      'SELECT access_token FROM whatsapp_connections WHERE tenant_id = ? AND phone_number_id = ? LIMIT 1',
-      [tenantId, phoneNumberId]
-    );
-
-    if (rows.length > 0) {
-      // Decrypt token (implement proper decryption)
-      return decryptToken(rows[0].access_token);
-    }
-
-    return null;
-  } catch (error) {
-    console.error('Error getting access token:', error);
-    return null;
-  }
-}
-
-/**
- * Decrypt token
- */
-function decryptToken(encryptedToken) {
-  // Implement proper decryption
-  // For now, return as-is (assuming stored unencrypted for development)
-  return encryptedToken;
-}
-
-/**
- * Get pending orders (no payment in last hour)
- */
-async function getPendingOrders() {
-  try {
-    // Query MycroShop API for pending orders
-    // This would call: GET /api/v1/online-store-orders?status=pending&created_after=1hour
-    // For now, return empty array
-    return [];
-  } catch (error) {
-    console.error('Error getting pending orders:', error);
+    return rows.map(r => ({
+      tenant_id:       r.tenant_id,
+      phone_number_id: r.phone_number_id,
+      access_token:    r.access_token,
+      store_name:      r.store_name || 'the store',
+    }));
+  } catch (err) {
+    console.error('[follow-up] getActiveTenants error:', err.message);
     return [];
   }
 }
-
-/**
- * Get abandoned carts
- */
-async function getAbandonedCarts() {
-  try {
-    // Query for orders created but no payment initiated
-    // Return empty for now
-    return [];
-  } catch (error) {
-    console.error('Error getting abandoned carts:', error);
-    return [];
-  }
-}
-
-/**
- * Get inactive customers
- */
-async function getInactiveCustomers() {
-  try {
-    // Query Firestore for customers with no messages in 7+ days
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    
-    // This would query all conversations and find inactive ones
-    // Return empty for now
-    return [];
-  } catch (error) {
-    console.error('Error getting inactive customers:', error);
-    return [];
-  }
-}
-
-/**
- * Get new products for re-engagement
- */
-async function getNewProducts(tenantId) {
-  try {
-    // Query MycroShop API for new products
-    // GET /api/v1/inventory?sort=created_at&limit=5
-    // Return empty for now
-    return [];
-  } catch (error) {
-    console.error('Error getting new products:', error);
-    return [];
-  }
-}
-
-/**
- * Save follow-up message to conversation history
- */
-async function saveFollowUpMessage(tenantId, customerPhone, message, followUpType) {
-  try {
-    const conversationRef = db
-      .collection('tenants')
-      .doc(tenantId.toString())
-      .collection('conversations')
-      .doc(customerPhone);
-
-    await conversationRef.collection('messages').add({
-      role: 'assistant',
-      message,
-      messageType: 'follow_up',
-      followUpType,
-      timestamp: FieldValue.serverTimestamp(),
-      createdAt: new Date()
-    });
-
-    await conversationRef.set({
-      lastMessage: message,
-      lastMessageRole: 'assistant',
-      lastMessageAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp()
-    }, { merge: true });
-  } catch (error) {
-    console.error('Error saving follow-up message:', error);
-  }
-}
-
-module.exports = { followUpScheduler };
-
